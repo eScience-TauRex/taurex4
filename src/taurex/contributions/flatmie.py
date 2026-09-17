@@ -1,0 +1,188 @@
+"""Module for computing flat Mie opacity."""
+
+import typing as t
+
+import numpy as np
+import numpy.typing as npt
+from astropy import units as u
+
+from taurex.data.fittable import fitparam
+from taurex.model import OneDForwardModel
+from taurex.output import OutputGroup
+from taurex.types import get_float_dtype
+from taurex.util import convert_to_unit_value
+
+from .contribution import Contribution
+
+
+class FlatMieContribution(Contribution):
+    """Computes a flat (gray) absorption contribution.
+
+    Absorption is computed as a flat value between two pressures
+    across all wavenumbers.
+
+    """
+
+    def __init__(
+        self,
+        flat_mix_ratio: t.Union[float, u.Quantity] = 1e-10,
+        flat_bottomP: t.Union[float, u.Quantity] = -1,  # noqa: N803
+        flat_topP: t.Union[float, u.Quantity] = -1,
+    ) -> None:
+        """Initialize FlatMieContribution.
+
+        Parameters
+        ----------
+        flat_mix_ratio: float or astropy.units.Quantity
+            Effective opacity in m2
+
+        flat_bottomP: float
+            Bottom of absorbing region in Pa
+
+        flat_topP: float
+            Top of absorbing region in Pa
+
+        """
+        super().__init__("Mie")
+
+        self._mie_mix = self._normalize_opacity(flat_mix_ratio)
+        self._mie_bottom_pressure = self._normalize_pressure(flat_bottomP)
+        self._mie_top_pressure = self._normalize_pressure(flat_topP)
+
+    @staticmethod
+    def _normalize_opacity(value: t.Any) -> t.Any:
+        """Convert effective opacity to plain numeric values in m2."""
+        return convert_to_unit_value(value, u.m**2, default_unit=u.m**2)
+
+    @staticmethod
+    def _normalize_pressure(value: t.Any) -> t.Any:
+        """Convert pressure to plain numeric values in Pa."""
+        return convert_to_unit_value(value, u.Pa, default_unit=u.Pa)
+
+    @fitparam(
+        param_name="flat_topP",
+        param_latex=r"$P^{mie}_\mathrm{top}$",
+        default_mode="log",
+        default_fit=False,
+        default_bounds=[1e-20, 1],
+    )
+    def mieTopPressure(self) -> float:  # noqa: N802
+        """Pressure at top of absorbing region in Pa."""
+        return self._mie_top_pressure
+
+    @mieTopPressure.setter
+    def mieTopPressure(self, value: t.Union[float, u.Quantity]) -> None:  # noqa: N802
+        self._mie_top_pressure = self._normalize_pressure(value)
+
+    @fitparam(
+        param_name="flat_bottomP",
+        param_latex=r"$P^{mie}_\mathrm{bottom}$",
+        default_mode="log",
+        default_fit=False,
+        default_bounds=[1e-20, 1],
+    )
+    def mieBottomPressure(self) -> float:  # noqa: N802
+        """Pressure at bottom of absorbing region in Pa."""
+        return self._mie_bottom_pressure
+
+    @mieBottomPressure.setter
+    def mieBottomPressure(  # noqa: N802
+        self, value: t.Union[float, u.Quantity]
+    ) -> None:
+        self._mie_bottom_pressure = self._normalize_pressure(value)
+
+    @fitparam(
+        param_name="flat_mix_ratio",
+        param_latex=r"$\chi_\mathrm{mie}$",
+        default_mode="log",
+        default_fit=False,
+        default_bounds=[1e-20, 1],
+    )
+    def mieMixing(self) -> float:  # noqa: N802
+        """Opacity of absorbing region in :math:`m^2`."""
+        return self._mie_mix
+
+    @mieMixing.setter
+    def mieMixing(self, value: t.Union[float, u.Quantity]) -> None:  # noqa: N802
+        self._mie_mix = self._normalize_opacity(value)
+
+    def prepare_each(
+        self, model: OneDForwardModel, wngrid: npt.NDArray[np.float64]
+    ) -> t.Generator[t.Tuple[str, npt.NDArray[np.float64]], None, None]:
+        """Computes and flat absorbing opacity for the pressure regions given.
+
+        Parameters
+        ----------
+        model: :class:`~taurex.model.model.ForwardModel`
+            Forward model
+
+        wngrid: :obj:`array`
+            Wavenumber grid
+
+        Yields
+        ------
+        component: :obj:`tuple` of type (str, :obj:`array`)
+            ``Flat`` and the weighted mie opacity.
+
+
+        """
+        self._nlayers = model.nLayers
+        self._ngrid = wngrid.shape[0]
+
+        pressure_levels = model.pressure.pressure_profile_levels[::-1]
+        if self.mieBottomPressure < 0:
+            bottom_pressure = np.log10(pressure_levels.max())
+        else:
+            bottom_pressure = np.log10(self.mieBottomPressure)
+        if self.mieTopPressure < 0:
+            top_pressure = np.log10(pressure_levels.min())
+        else:
+            top_pressure = np.log10(self.mieTopPressure)
+        pressure_levels = np.log10(pressure_levels)
+
+        p_left = pressure_levels[:-1]
+        p_right = pressure_levels[1:]
+
+        p_range = sorted([top_pressure, bottom_pressure])
+
+        save_start = np.searchsorted(p_right, p_range[0], side="right")
+        save_stop = np.searchsorted(p_left[1:], p_range[1], side="right")
+        p_min = p_left[save_start : save_stop + 1]
+        p_max = p_right[save_start : save_stop + 1]
+        weight = np.minimum(p_range[-1], p_max) - np.maximum(p_range[0], p_min)
+        weight /= weight.max()
+        sigma_xsec = np.zeros(
+            shape=(self._nlayers, wngrid.shape[0]), dtype=get_float_dtype()
+        )
+        sigma_xsec[save_start : save_stop + 1] = weight[:, None] * self.mieMixing
+
+        sigma_xsec = sigma_xsec[::-1]
+
+        self.sigma_xsec = sigma_xsec
+
+        yield "Flat", sigma_xsec
+
+    def write(self, output: OutputGroup) -> OutputGroup:
+        """Write contribution to output.
+
+        Parameters
+        ----------
+        output: :class:`~taurex.output.output.Output`
+            Output object to write to
+
+        Returns
+        -------
+        output: :class:`~taurex.output.output.Output`
+            Output object that was written to
+
+        """
+        contrib = super().write(output)
+        contrib.write_scalar("flat_mix_ratio", self._mie_mix)
+        contrib.write_scalar("flat_bottomP", self._mie_bottom_pressure)
+        contrib.write_scalar("flat_topP", self._mie_top_pressure)
+        return contrib
+
+    @classmethod
+    def input_keywords(cls) -> t.Tuple[str]:
+        """Return input keywords for the contribution."""
+        return ("FlatMie",)

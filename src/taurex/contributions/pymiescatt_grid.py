@@ -1,0 +1,916 @@
+"""Precomputed Mie extinction grids for scalable cloud retrievals."""
+
+import typing as t
+
+import h5py
+import numpy as np
+import numpy.typing as npt
+import scipy.stats as stats
+from astropy import units as u
+
+from taurex.cache import GlobalCache
+from taurex.exceptions import InvalidModelException
+from taurex.mpi import allocate_as_shared
+from taurex.mpi import has_mpi
+from taurex.mpi import shared_rank
+from taurex.output import OutputGroup
+from taurex.types import get_float_dtype
+from taurex.util import convert_to_unit_value
+
+from .contribution import Contribution
+
+
+if t.TYPE_CHECKING:
+    from taurex.model.model import ForwardModel
+else:
+    ForwardModel = object
+
+
+def _as_list(value: t.Any) -> t.List[t.Any]:
+    """Ensure value is a list."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _broadcast_param(
+    value: t.Any,
+    count: int,
+    name: str,
+    *,
+    allow_none: bool = False,
+) -> t.Optional[t.List[t.Any]]:
+    """Broadcast a parameter value to match the number of species.
+
+    Parameters
+    ----------
+    value : Any
+        The parameter value to broadcast.
+    count : int
+        The number of species.
+    name : str
+        The name of the parameter (used in error messages).
+    allow_none : bool, optional
+        If True, allow None to be returned as is. Default is False.
+
+    Returns
+    -------
+    Optional[List[Any]]
+        A list of length ``count`` with the broadcast values, or None
+        if ``allow_none`` is True and value is None.
+
+    Raises
+    ------
+    InvalidPyMieScattGridException
+        If the parameter cannot be broadcast to the required length.
+
+    """
+    if value is None:
+        if allow_none:
+            return None
+        raise InvalidPyMieScattGridException(f"{name} must be provided")
+
+    values = _as_list(value)
+
+    if len(values) == 1 and count > 1:
+        return values * count
+
+    if len(values) != count:
+        raise InvalidPyMieScattGridException(
+            f"{name} must have length 1 or match the number of species ({count})"
+        )
+
+    return values
+
+
+def contribute_mie_tau_numpy(
+    start_k: int,
+    end_k: int,
+    sigma: npt.NDArray[np.float64],
+    path: npt.NDArray[np.float64],
+    ngrid: int,
+    layer: int,
+    tau: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    """Integrate Mie optical depth for a given layer using numpy."""
+    for k in range(start_k, end_k):
+        _path = path[k]
+        for wn in range(ngrid):
+            tau[layer, wn] += sigma[k + layer, wn] * _path
+
+    return tau
+
+
+try:
+    import numba
+
+    contribute_mie_tau = numba.jit(contribute_mie_tau_numpy, nopython=True, nogil=True)
+except ImportError:
+    contribute_mie_tau = contribute_mie_tau_numpy
+
+
+class InvalidPyMieScattGridException(InvalidModelException):
+    """Raised when the precomputed-grid Mie contribution is misconfigured."""
+
+
+class PyMieScattGridExtinctionContribution(Contribution):
+    """Cloud opacity from precomputed extinction-efficiency grids.
+
+    The supplied HDF5 files are expected to contain a ``radius_grid`` dataset
+    in microns, a ``wavenumber_grid`` dataset in :math:`cm^{-1}`, and either a
+    ``Qext`` or ``Qext_grid`` dataset containing extinction efficiencies.
+    """
+    # The kernel below integrates the cross-section against the path length
+    # alone and takes no density at all.
+    density_power = 0
+    _path_matrix_accumulation = True
+    # Pre-assign lists to avoid mutable default arguments
+    _default_mean_radius = [0.01]
+    _default_logstd_radius = [0.001]
+    _default_param_a = [1.0]
+    _default_param_b = [6.0]
+    _default_param_c = [6.0]
+    _default_param_d = [1.0]
+    _default_mix_ratio = [1e-10]
+    _default_species = ["Mg2SiO4"]
+    _default_midP = [1e3]
+    _default_rangeP = [1.0]
+    _default_altitude_decay = [-5.0]
+    _default_porosity = [0.0]
+
+    def __init__(
+        self,
+        mie_particle_mean_radius: t.Optional[t.Any] = None,
+        mie_particle_logstd_radius: t.Any = (0.001,),
+        mie_particle_param_a: t.Any = (1.0,),
+        mie_particle_param_b: t.Any = (6.0,),
+        mie_particle_param_c: t.Any = (6.0,),
+        mie_particle_param_d: t.Any = (1.0,),
+        mie_particle_radius_nsampling: int = 5,
+        mie_particle_radius_dsampling: float = 2,
+        mie_particle_radius_distribution: str = "normal",
+        mie_species_path: t.Optional[t.Any] = None,
+        species: t.Any = ("Mg2SiO4",),
+        mie_particle_mix_ratio: t.Any = (1e-10,),
+        mie_porosity: t.Optional[t.Any] = None,
+        mie_midP: t.Any = (1e3,),
+        mie_rangeP: t.Any = (1.0,),
+        mie_nMedium: float = 1,
+        mie_resolution: int = 100,
+        mie_particle_altitude_distrib: str = "exp_decay",
+        mie_particle_altitude_decay: t.Any = (-5.0,),
+        name: str = "PyMieScattGridExtinction",
+    ) -> None:
+        """Initialize PyMieScattGridExtinctionContribution.
+
+        Parameters
+        ----------
+        mie_particle_mean_radius : optional
+            Mean particle radius in microns, by default None (uses 0.01).
+        mie_particle_logstd_radius : optional
+            Log standard deviation of particle radius, by default (0.001,).
+        mie_particle_param_a : optional
+            Parameter A for Deirmendjian distribution, by default (1.0,).
+        mie_particle_param_b : optional
+            Parameter B for Deirmendjian distribution, by default (6.0,).
+        mie_particle_param_c : optional
+            Parameter C for Deirmendjian distribution, by default (6.0,).
+        mie_particle_param_d : optional
+            Parameter D for Deirmendjian distribution, by default (1.0,).
+        mie_particle_radius_nsampling : int, optional
+            Number of radius samples, by default 5.
+        mie_particle_radius_dsampling : float, optional
+            Sampling range in standard deviations, by default 2.
+        mie_particle_radius_distribution : str, optional
+            Radius distribution type, by default "normal".
+        mie_species_path : optional
+            Paths to the species opacity files, by default None.
+        species : optional
+            Species names, by default ("Mg2SiO4",).
+        mie_particle_mix_ratio : optional
+            Mixing ratios, by default (1e-10,).
+        mie_porosity : optional
+            Porosity values, by default None.
+        mie_midP : optional
+            Mid-pressure levels in Pa, by default (1e3,).
+        mie_rangeP : optional
+            Pressure range in log10, by default (1.0,).
+        mie_nMedium : float, optional
+            Refractive index of the medium, by default 1.
+        mie_resolution : int, optional
+            Resolution of the wavenumber grid, by default 100.
+        mie_particle_altitude_distrib : str, optional
+            Altitude distribution type, by default "exp_decay".
+        mie_particle_altitude_decay : optional
+            Altitude decay parameters, by default (-5.0,).
+        name : str, optional
+            Contribution name, by default "PyMieScattGridExtinction".
+
+        """
+        super().__init__(name)
+
+        self._species = _as_list(species)
+        self._species_count = len(self._species)
+
+        if self._species_count == 0:
+            raise InvalidPyMieScattGridException(
+                "At least one species must be provided"
+            )
+
+        mean_radius = (
+            self._default_mean_radius
+            if mie_particle_mean_radius is None
+            else mie_particle_mean_radius
+        )
+        self._mie_species_path = _broadcast_param(
+            mie_species_path, self._species_count, "mie_species_path"
+        )
+        self._mie_particle_mean_radius = _broadcast_param(
+            self._normalize_radius(mean_radius),
+            self._species_count,
+            "mie_particle_mean_radius",
+        )
+        self._mie_particle_std_radius = _broadcast_param(
+            self._normalize_dimensionless(mie_particle_logstd_radius),
+            self._species_count,
+            "mie_particle_logstd_radius",
+        )
+        self._mie_particle_param_a = _broadcast_param(
+            self._normalize_dimensionless(mie_particle_param_a),
+            self._species_count,
+            "mie_particle_param_a",
+        )
+        self._mie_particle_param_b = _broadcast_param(
+            self._normalize_dimensionless(mie_particle_param_b),
+            self._species_count,
+            "mie_particle_param_b",
+        )
+        self._mie_particle_param_c = _broadcast_param(
+            self._normalize_dimensionless(mie_particle_param_c),
+            self._species_count,
+            "mie_particle_param_c",
+        )
+        self._mie_particle_param_d = _broadcast_param(
+            self._normalize_dimensionless(mie_particle_param_d),
+            self._species_count,
+            "mie_particle_param_d",
+        )
+        self._mie_particle_mix_ratio = _broadcast_param(
+            self._normalize_number_density(mie_particle_mix_ratio),
+            self._species_count,
+            "mie_particle_mix_ratio",
+        )
+        self._mie_porosity = _broadcast_param(
+            self._normalize_dimensionless(mie_porosity),
+            self._species_count,
+            "mie_porosity",
+            allow_none=True,
+        )
+        self._mie_midP = _broadcast_param(
+            self._normalize_pressure(mie_midP), self._species_count, "mie_midP"
+        )
+        self._mie_rangeP = _broadcast_param(
+            self._normalize_dimensionless(mie_rangeP),
+            self._species_count,
+            "mie_rangeP",
+        )
+        self._particle_alt_decay = _broadcast_param(
+            self._normalize_dimensionless(mie_particle_altitude_decay),
+            self._species_count,
+            "mie_particle_altitude_decay",
+        )
+
+        self._mie_particle_radius_distribution = (
+            mie_particle_radius_distribution.lower().strip()
+        )
+        self._particle_alt_distib = mie_particle_altitude_distrib.lower().strip()
+        self._mie_nMedium = self._normalize_dimensionless(mie_nMedium)
+        self._resolution = int(self._normalize_dimensionless(mie_resolution))
+        self._nsampling = int(
+            self._normalize_dimensionless(mie_particle_radius_nsampling)
+        )
+        self._dsampling = self._normalize_dimensionless(mie_particle_radius_dsampling)
+
+        if self._mie_particle_radius_distribution not in {
+            "normal",
+            "budaj",
+            "deirmendjian",
+        }:
+            raise InvalidPyMieScattGridException(
+                "mie_particle_radius_distribution must be one of: "
+                "normal, budaj, deirmendjian"
+            )
+
+        if self._particle_alt_distib not in {"exp_decay", "linear"}:
+            raise InvalidPyMieScattGridException(
+                "mie_particle_altitude_distrib must be 'exp_decay' or 'linear'"
+            )
+
+        self._radius_grid, self._qext, self._qext_wn = self.load_input_files(
+            self._mie_species_path
+        )
+        self.generate_particle_fitting_params()
+
+    @staticmethod
+    def _normalize_radius(value: t.Any) -> t.Any:
+        """Convert particle radii to plain numeric microns."""
+        return convert_to_unit_value(value, u.um, default_unit=u.um)
+
+    @staticmethod
+    def _normalize_dimensionless(value: t.Any) -> t.Any:
+        """Convert dimensionless quantities to plain numeric form."""
+        return convert_to_unit_value(
+            value,
+            u.dimensionless_unscaled,
+            default_unit=u.dimensionless_unscaled,
+        )
+
+    @staticmethod
+    def _normalize_number_density(value: t.Any) -> t.Any:
+        """Convert particle number densities to plain numeric values in m^-3."""
+        return convert_to_unit_value(value, u.m**-3, default_unit=u.m**-3)
+
+    @staticmethod
+    def _normalize_pressure(value: t.Any) -> t.Any:
+        """Convert pressures to plain numeric values in Pa."""
+        return convert_to_unit_value(value, u.Pa, default_unit=u.Pa)
+
+    @staticmethod
+    def _read_qext_dataset(
+        grid_file: h5py.File,
+        path: str,
+        dtype: npt.DTypeLike,
+    ) -> npt.NDArray[np.float64]:
+        """Read the Qext dataset from the HDF5 file.
+
+        Parameters
+        ----------
+        grid_file : h5py.File
+            The HDF5 file object.
+        path : str
+            Path to the file (used in error messages).
+        dtype : npt.DTypeLike
+            Data type for the returned array (e.g. np.float32, np.float64).
+
+        Returns
+        -------
+        npt.NDArray[np.float64]
+            The Qext dataset.
+
+        Raises
+        ------
+        InvalidPyMieScattGridException
+            If the required dataset is not found.
+
+        """
+        for dataset_name in ("Qext", "Qext_grid"):
+            if dataset_name in grid_file:
+                return np.asarray(grid_file[dataset_name][()], dtype=dtype)
+
+        raise InvalidPyMieScattGridException(
+            f"{path} must contain a 'Qext' or 'Qext_grid' dataset"
+        )
+
+    def load_input_files(self, paths: t.Sequence[str]) -> t.Tuple[
+        t.List[npt.NDArray[np.float64]],
+        t.List[npt.NDArray[np.float64]],
+        t.List[npt.NDArray[np.float64]],
+    ]:
+        """Load input files for all species."""
+        radius_grids = []
+        qexts = []
+        wavenumber_grids = []
+
+        use_shared = bool(GlobalCache()["mpi_use_shared"])
+        sh_root = (not has_mpi()) or shared_rank() == 0
+        target_dtype = get_float_dtype()
+
+        for path in paths:
+            if use_shared and not sh_root:
+                radius_grid = None
+                wavenumber_grid = None
+                qext_grid = None
+            else:
+                with h5py.File(path, "r") as grid_file:
+                    try:
+                        radius_grid = np.asarray(
+                            grid_file["radius_grid"][()], dtype=target_dtype
+                        )
+                        wavenumber_grid = np.asarray(
+                            grid_file["wavenumber_grid"][()], dtype=target_dtype
+                        )
+                    except KeyError as exc:
+                        raise InvalidPyMieScattGridException(
+                            f"{path} is missing required dataset {exc!s}"
+                        ) from exc
+
+                    qext_grid = self._read_qext_dataset(
+                        grid_file,
+                        path,
+                        target_dtype,
+                    )
+
+            if use_shared:
+                radius_grid = allocate_as_shared(radius_grid, logger=self)
+                wavenumber_grid = allocate_as_shared(wavenumber_grid, logger=self)
+                qext_grid = allocate_as_shared(qext_grid, logger=self)
+
+            radius_grids.append(radius_grid)
+            qexts.append(qext_grid)
+            wavenumber_grids.append(wavenumber_grid)
+
+        return radius_grids, qexts, wavenumber_grids
+
+    def contribute(
+        self,
+        model: ForwardModel,
+        start_layer: int,
+        end_layer: int,
+        density_offset: int,
+        layer: int,
+        density: npt.NDArray[np.float64],
+        tau: npt.NDArray[np.float64],
+        path_length: t.Optional[npt.NDArray[np.float64]] = None,
+    ):
+        """Contribute to the optical depth."""
+        contribute_mie_tau(
+            start_layer,
+            end_layer,
+            self.sigma_xsec,
+            path_length,
+            self._ngrid,
+            layer,
+            tau,
+        )
+
+    def generate_particle_fitting_params(self) -> None:  # noqa: C901
+        """Generate fitting parameters for particle sizes.
+
+        The parameters generated are:
+            - ``Rmean_share``
+            - ``Rlogstd_share`` (if distribution is not "budaj")
+            - ``X_share``
+            - ``midP_share``
+            - ``rangeP_share``
+            - ``decayP_share``
+            - For each species: ``Rmean_``, ``Rlogstd_`` (if not "budaj"),
+              ``X_``, ``midP_``, ``rangeP_``, ``decayP_``.
+            - For each species: ``Porosity_`` if porosity is not None.
+        """
+        bounds_rm = [0.01, 10]
+        bounds_rstd = [0.01, 0.2]
+        bounds_x = [1e0, 1e12]
+        bounds_midp = [1e6, 1e0]
+        bounds_rangep = [0.0, 3]
+        bounds_decayp = [-7, 0]
+        bounds_poro = [0, 1]
+
+        param_name = "Rmean_share"
+        param_latex = "$Rmean_share$"
+
+        def read_rmean_share(self):
+            return np.mean(self._mie_particle_mean_radius)
+
+        def write_rmean_share(self, value):
+            normalized = self._normalize_radius(value)
+            self._mie_particle_mean_radius[:] = [normalized] * len(
+                self._mie_particle_mean_radius
+            )
+
+        self.add_fittable_param(
+            param_name,
+            param_latex,
+            read_rmean_share,
+            write_rmean_share,
+            "log",
+            False,
+            bounds_rm,
+        )
+
+        if self._mie_particle_radius_distribution != "budaj":
+            param_name = "Rlogstd_share"
+            param_latex = "$Rlogstd_share$"
+
+            def read_rstd_share(self):
+                return np.mean(self._mie_particle_std_radius)
+
+            def write_rstd_share(self, value):
+                normalized = self._normalize_dimensionless(value)
+                self._mie_particle_std_radius[:] = [normalized] * len(
+                    self._mie_particle_std_radius
+                )
+
+            self.add_fittable_param(
+                param_name,
+                param_latex,
+                read_rstd_share,
+                write_rstd_share,
+                "linear",
+                False,
+                bounds_rstd,
+            )
+
+        param_name = "X_share"
+        param_latex = "$X_share$"
+
+        def read_x_share(self):
+            return np.mean(self._mie_particle_mix_ratio)
+
+        def write_x_share(self, value):
+            normalized = self._normalize_number_density(value)
+            self._mie_particle_mix_ratio[:] = [normalized] * len(
+                self._mie_particle_mix_ratio
+            )
+
+        self.add_fittable_param(
+            param_name,
+            param_latex,
+            read_x_share,
+            write_x_share,
+            "log",
+            False,
+            bounds_x,
+        )
+
+        param_name = "midP_share"
+        param_latex = "$midP_share$"
+
+        def read_midp_share(self):
+            return np.mean(self._mie_midP)
+
+        def write_midp_share(self, value):
+            normalized = self._normalize_pressure(value)
+            self._mie_midP[:] = [normalized] * len(self._mie_midP)
+
+        self.add_fittable_param(
+            param_name,
+            param_latex,
+            read_midp_share,
+            write_midp_share,
+            "log",
+            False,
+            bounds_midp,
+        )
+
+        param_name = "rangeP_share"
+        param_latex = "$rangeP_share$"
+
+        def read_rangep_share(self):
+            return np.mean(self._mie_rangeP)
+
+        def write_rangep_share(self, value):
+            normalized = self._normalize_dimensionless(value)
+            self._mie_rangeP[:] = [normalized] * len(self._mie_rangeP)
+
+        self.add_fittable_param(
+            param_name,
+            param_latex,
+            read_rangep_share,
+            write_rangep_share,
+            "linear",
+            False,
+            bounds_rangep,
+        )
+
+        param_name = "decayP_share"
+        param_latex = "$decayP_share$"
+
+        def read_decayp_share(self):
+            return np.mean(self._particle_alt_decay)
+
+        def write_decayp_share(self, value):
+            normalized = self._normalize_dimensionless(value)
+            self._particle_alt_decay[:] = [normalized] * len(self._particle_alt_decay)
+
+        self.add_fittable_param(
+            param_name,
+            param_latex,
+            read_decayp_share,
+            write_decayp_share,
+            "linear",
+            False,
+            bounds_decayp,
+        )
+
+        for idx, val in enumerate(self._species):
+            param_name = f"Rmean_{val}"
+            param_latex = f"$Rmean_{val}$"
+
+            def read_rmean(self, idx=idx):
+                return self._mie_particle_mean_radius[idx]
+
+            def write_rmean(self, value, idx=idx):
+                self._mie_particle_mean_radius[idx] = self._normalize_radius(value)
+
+            self.add_fittable_param(
+                param_name,
+                param_latex,
+                read_rmean,
+                write_rmean,
+                "log",
+                False,
+                bounds_rm,
+            )
+
+            if self._mie_particle_radius_distribution != "budaj":
+                param_name = f"Rlogstd_{val}"
+                param_latex = f"$Rlogstd_{val}$"
+
+                def read_rstd(self, idx=idx):
+                    return self._mie_particle_std_radius[idx]
+
+                def write_rstd(self, value, idx=idx):
+                    self._mie_particle_std_radius[idx] = self._normalize_dimensionless(
+                        value
+                    )
+
+                self.add_fittable_param(
+                    param_name,
+                    param_latex,
+                    read_rstd,
+                    write_rstd,
+                    "linear",
+                    False,
+                    bounds_rstd,
+                )
+
+            if self._mie_porosity is not None:
+                param_name = f"Porosity_{val}"
+                param_latex = f"$Porosity_{val}$"
+
+                def read_poro(self, idx=idx):
+                    return self._mie_porosity[idx]
+
+                def write_poro(self, value, idx=idx):
+                    self._mie_porosity[idx] = self._normalize_dimensionless(value)
+
+                self.add_fittable_param(
+                    param_name,
+                    param_latex,
+                    read_poro,
+                    write_poro,
+                    "linear",
+                    False,
+                    bounds_poro,
+                )
+
+            param_name = f"X_{val}"
+            param_latex = f"$X_{val}$"
+
+            def read_x(self, idx=idx):
+                return self._mie_particle_mix_ratio[idx]
+
+            def write_x(self, value, idx=idx):
+                self._mie_particle_mix_ratio[idx] = self._normalize_number_density(
+                    value
+                )
+
+            self.add_fittable_param(
+                param_name,
+                param_latex,
+                read_x,
+                write_x,
+                "log",
+                False,
+                bounds_x,
+            )
+
+            param_name = f"midP_{val}"
+            param_latex = f"$midP_{val}$"
+
+            def read_midp(self, idx=idx):
+                return self._mie_midP[idx]
+
+            def write_midp(self, value, idx=idx):
+                self._mie_midP[idx] = self._normalize_pressure(value)
+
+            self.add_fittable_param(
+                param_name,
+                param_latex,
+                read_midp,
+                write_midp,
+                "log",
+                False,
+                bounds_midp,
+            )
+
+            param_name = f"rangeP_{val}"
+            param_latex = f"$rangeP_{val}$"
+
+            def read_rangep(self, idx=idx):
+                return self._mie_rangeP[idx]
+
+            def write_rangep(self, value, idx=idx):
+                self._mie_rangeP[idx] = self._normalize_dimensionless(value)
+
+            self.add_fittable_param(
+                param_name,
+                param_latex,
+                read_rangep,
+                write_rangep,
+                "linear",
+                False,
+                bounds_rangep,
+            )
+
+            param_name = f"decayP_{val}"
+            param_latex = f"$decayP_{val}$"
+
+            def read_decayp(self, idx=idx):
+                return self._particle_alt_decay[idx]
+
+            def write_decayp(self, value, idx=idx):
+                self._particle_alt_decay[idx] = self._normalize_dimensionless(value)
+
+            self.add_fittable_param(
+                param_name,
+                param_latex,
+                read_decayp,
+                write_decayp,
+                "linear",
+                False,
+                bounds_decayp,
+            )
+
+    def prepare_each(
+        self, model: ForwardModel, wngrid: npt.NDArray[np.float64]
+    ) -> t.Generator[t.Tuple[str, npt.NDArray[np.float64]], None, None]:
+        """Prepare each component of the cloud opacity."""
+        self._nlayers = model.nLayers
+        self._ngrid = wngrid.shape[0]
+        pressure_profile = model.pressureProfile
+        sigma_xsec = np.zeros(
+            shape=(self._nlayers, self._ngrid), dtype=get_float_dtype()
+        )
+
+        for specie_idx, _ in enumerate(self._species):
+            wn = self._qext_wn[specie_idx]
+            mean_radius = self._mie_particle_mean_radius[specie_idx]
+
+            if self._mie_particle_radius_distribution == "budaj":
+                log_rsigma = 0.2
+                radii_log = np.linspace(
+                    10 ** (np.log10(mean_radius) + self._dsampling * log_rsigma),
+                    10 ** (np.log10(mean_radius) - self._dsampling * log_rsigma),
+                    self._nsampling,
+                )
+                weights = ((radii_log / mean_radius) ** 6) * np.exp(
+                    -6 * radii_log / mean_radius
+                )
+            elif self._mie_particle_radius_distribution == "deirmendjian":
+                log_rsigma = self._mie_particle_std_radius[specie_idx]
+                radii_log = np.linspace(
+                    10 ** (np.log10(mean_radius) + self._dsampling * log_rsigma),
+                    10 ** (np.log10(mean_radius) - self._dsampling * log_rsigma),
+                    self._nsampling,
+                )
+                weights = (
+                    self._mie_particle_param_a[specie_idx]
+                    * (radii_log ** self._mie_particle_param_b[specie_idx])
+                    * np.exp(
+                        -self._mie_particle_param_c[specie_idx]
+                        * (radii_log ** self._mie_particle_param_d[specie_idx])
+                    )
+                )
+            else:
+                log_rsigma = self._mie_particle_std_radius[specie_idx]
+                radii_log = np.linspace(
+                    10 ** (np.log10(mean_radius) + self._dsampling * log_rsigma),
+                    10 ** (np.log10(mean_radius) - self._dsampling * log_rsigma),
+                    self._nsampling,
+                )
+                weights = stats.norm.pdf(
+                    np.log10(radii_log), np.log10(mean_radius), log_rsigma
+                )
+
+            qexts = []
+            radius_grid = self._radius_grid[specie_idx]
+            qext_grid = self._qext[specie_idx]
+
+            for radius in radii_log:
+                grid_idx = np.searchsorted(radius_grid, radius) - 1
+                grid_idx = int(np.clip(grid_idx, 0, radius_grid.shape[0] - 2))
+
+                radius_1 = radius_grid[grid_idx]
+                radius_2 = radius_grid[grid_idx + 1]
+                delta_radius = radius_1 - radius_2
+
+                qext_1 = qext_grid[grid_idx]
+                qext_2 = qext_grid[grid_idx + 1]
+
+                slope = (qext_1 - qext_2) / delta_radius
+                intercept = qext_1 - slope * radius_1
+                qexts.append(slope * radius + intercept)
+
+            qexts = np.asarray(qexts) * np.power(radii_log[:, None] * 1e3, 2)
+            qext_mean = np.average(qexts, axis=0, weights=weights)
+            wn_order = np.argsort(wn)
+            qext_interp = np.interp(
+                wngrid,
+                wn[wn_order],
+                qext_mean[wn_order],
+                left=0,
+                right=0,
+            )
+
+            sigma_mie = np.zeros(self._ngrid, dtype=get_float_dtype())
+            valid_qext = qext_interp != 0
+            sigma_mie[valid_qext] = qext_interp[valid_qext] * np.pi * 1e-18
+
+            if self._mie_midP[specie_idx] == -1:
+                bottom_pressure = pressure_profile[0]
+                top_pressure = pressure_profile[-1]
+            else:
+                bottom_pressure = 10 ** (
+                    np.log10(self._mie_midP[specie_idx])
+                    + self._mie_rangeP[specie_idx] / 2
+                )
+                top_pressure = 10 ** (
+                    np.log10(self._mie_midP[specie_idx])
+                    - self._mie_rangeP[specie_idx] / 2
+                )
+
+            cloud_filter = (pressure_profile <= bottom_pressure) & (
+                pressure_profile >= top_pressure
+            )
+
+            if self._particle_alt_distib == "exp_decay":
+                decay = self._particle_alt_decay[specie_idx]
+                mix = self._mie_particle_mix_ratio[specie_idx] * (
+                    pressure_profile / bottom_pressure
+                ) ** (-decay)
+                sigma_xsec[cloud_filter, :] += (
+                    sigma_mie[None, :] * mix[cloud_filter, None]
+                )
+            else:
+                sigma_xsec[cloud_filter, :] += (
+                    sigma_mie[None, :] * self._mie_particle_mix_ratio[specie_idx]
+                )
+
+        self.sigma_xsec = sigma_xsec
+        yield "PyMieScattGridExt", sigma_xsec
+
+    def write(self, output: OutputGroup) -> OutputGroup:
+        """Write contribution to output group."""
+        contrib = super().write(output)
+        contrib.write_array(
+            "particle_mean_radius", np.array(self._mie_particle_mean_radius)
+        )
+        if self._mie_particle_radius_distribution != "budaj":
+            contrib.write_array(
+                "particle_std_radius", np.array(self._mie_particle_std_radius)
+            )
+        contrib.write_array(
+            "particle_mix_ratio", np.array(self._mie_particle_mix_ratio)
+        )
+        contrib.write_array("particle_midP", np.array(self._mie_midP))
+        contrib.write_array("particle_rangeP", np.array(self._mie_rangeP))
+        contrib.write_string_array("cloud_species", self._species)
+        contrib.write_scalar("radius_Nsampling", self._nsampling)
+        contrib.write_scalar("radius_Dsampling", self._dsampling)
+        contrib.write_scalar("mie_nMedium", self._mie_nMedium)
+        return contrib
+
+    @classmethod
+    def input_keywords(cls) -> t.Tuple[str, ...]:
+        """Return input keywords for the contribution."""
+        return ("PyMieScattGridExtinction",)
+
+    BIBTEX_ENTRIES = [
+        """
+        @BOOK{1983asls.book.....B,
+               author = {{Bohren}, Craig F. and {Huffman}, Donald R.},
+                title = "{Absorption and scattering of light
+                         by small particles}",
+                 year = 1983,
+               adsurl = {https://ui.adsabs.harvard.edu/abs/
+                         1983asls.book.....B},
+              adsnote = {Provided by the SAO/NASA Astrophysics Data System}
+        }
+        @ARTICLE{2026A&A...707A.127V,
+               author = {{Voyer}, M. and {Changeat}, Q.},
+                title = "{Precomputed aerosol extinction, scattering,
+                         and asymmetry grids for scalable
+                         atmospheric retrievals}",
+              journal = {Astronomy and Astrophysics},
+             keywords = {radiative transfer, methods: numerical,
+                         planets and satellites: atmospheres,
+                         planets and satellites: gaseous planets,
+                         Earth and Planetary Astrophysics,
+                         Instrumentation and Methods for Astrophysics},
+                 year = 2026,
+                month = mar,
+               volume = {707},
+                  eid = {A127},
+                pages = {A127},
+                  doi = {10.1051/0004-6361/202558469},
+        archivePrefix = {arXiv},
+               eprint = {2601.14177},
+         primaryClass = {astro-ph.EP},
+               adsurl = {https://ui.adsabs.harvard.edu/abs/2026A&A...707A.127V},
+              adsnote = {Provided by the SAO/NASA Astrophysics Data System}
+        }
+        """,
+    ]

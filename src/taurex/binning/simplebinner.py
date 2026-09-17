@@ -1,0 +1,136 @@
+"""Simple binning module."""
+
+import typing as t
+
+import numpy as np
+import numpy.typing as npt
+from astropy import units as u
+
+from taurex import OutputSize
+from taurex.util import bindown
+from taurex.util import compute_bin_edges
+from taurex.util import convert_to_unit_value
+from taurex.util import wnwidth_to_wlwidth
+
+from ..types import ModelOutputType
+from .binner import BinDownType
+from .binner import Binner
+
+
+class SimpleBinner(Binner):
+    """Bins to a wavenumber grid given by ``wngrid``.
+
+    The method places flux into the correct bins
+    using histogramming methods. This is fast but can
+    suffer as it assumes that there are no gaps in the
+    wavenumber grid. This can cause weird results and
+    may cause the flux to be higher in the boundary
+    of points between two distinct regions
+    (such as WFC3 + Spitzer)
+
+    Parameters
+    ----------
+    wngrid: :obj:`array`
+        Wavenumber grid. Quantity values are converted to inverse centimetres;
+        wavelength quantities are also accepted.
+
+    wngrid_width: :obj:`array`, optional
+        Must have same shape as ``wngrid``
+        Full bin widths for each wavenumber grid point
+        given in ``wngrid``. Quantity values are converted to inverse centimetres.
+        If not provided then
+        this is automatically computed from ``wngrid``.
+
+    """
+
+    def __init__(
+        self,
+        wngrid: npt.NDArray[np.float64],
+        wngrid_width: t.Optional[npt.NDArray[np.float64]] = None,
+    ):
+        """Initialize SimpleBinner.
+
+        Parameters
+        ----------
+        wngrid: :obj:`array`
+            Wavenumber grid
+
+        wngrid_width: :obj:`array`, optional
+            Must have same shape as ``wngrid``
+            Full bin widths for each wavenumber grid point
+            given in ``wngrid``. If not provided then
+            this is automatically computed from ``wngrid``.
+
+        """
+        self._wngrid = np.asarray(
+            convert_to_unit_value(wngrid, u.k, equivalencies=u.spectral())
+        )
+        self._wn_width = (
+            None
+            if wngrid_width is None
+            else np.asarray(convert_to_unit_value(wngrid_width, u.k))
+        )
+        if self._wn_width is None:
+            self._wn_width = compute_bin_edges(self._wngrid)[-1]
+
+    def bindown(
+        self,
+        wngrid: npt.NDArray[np.float64],
+        spectrum: npt.NDArray[np.float64],
+        grid_width: t.Optional[npt.NDArray[np.float64]] = None,
+        error: t.Optional[npt.NDArray[np.float64]] = None,
+    ) -> BinDownType:
+        """Bins down spectrum.
+
+        Parameters
+        ----------
+        wngrid : :obj:`array`
+            The wavenumber grid of the spectrum to be binned down.
+
+        spectrum: :obj:`array`
+            The spectra we wish to bin-down. Must be same shape as
+            ``wngrid``.
+
+        grid_width: :obj:`array`, optional
+            Wavenumber grid full-widths for the spectrum to be binned down.
+            Must be same shape as ``wngrid``.
+            Optional.
+
+        error: :obj:`array`, optional
+            Associated errors or noise of the spectrum. Must be same shape
+            as ``wngrid``.Optional parameter.
+
+        Returns
+        -------
+        binned_wngrid : :obj:`array`
+            New wavenumber grid
+
+        spectrum: :obj:`array`
+            Binned spectrum.
+
+        grid_width: :obj:`array`
+            New grid-widths
+
+        error: :obj:`array` or None
+            Binned error if given else ``None``
+
+        """
+        return (
+            self._wngrid,
+            bindown(wngrid, spectrum, self._wngrid),
+            None,
+            self._wn_width,
+        )
+
+    def generate_spectrum_output(
+        self,
+        model_output: ModelOutputType,
+        output_size: t.Optional[OutputSize] = OutputSize.heavy,
+    ) -> dict:
+        """Generate spectrum output."""
+        output = super().generate_spectrum_output(model_output, output_size=output_size)
+        output["binned_wngrid"] = self._wngrid
+        output["binned_wlgrid"] = 10000 / self._wngrid
+        output["binned_wnwidth"] = self._wn_width
+        output["binned_wlwidth"] = wnwidth_to_wlwidth(self._wngrid, self._wn_width)
+        return output

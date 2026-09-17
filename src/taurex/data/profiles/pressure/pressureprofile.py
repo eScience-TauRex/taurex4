@@ -1,0 +1,278 @@
+"""Base and Concrete pressure profiles."""
+
+import math
+import typing as t
+
+import numpy as np
+import numpy.typing as npt
+from astropy import units as u
+
+from taurex.data.citation import Citable
+from taurex.data.fittable import Fittable
+from taurex.data.fittable import fitparam
+from taurex.log import Logger
+from taurex.output import OutputGroup
+from taurex.output.writeable import Writeable
+from taurex.types import get_float_dtype
+from taurex.util import convert_to_unit_value
+
+
+class PressureProfile(Fittable, Logger, Writeable, Citable):
+    """Base pressure class.
+
+    *Abstract Class*
+
+    Simple. Defines the layering
+    of the atmosphere. Only requires
+    implementation of:
+
+    - :func:`compute_pressure_profile`
+    - :func:`profile`
+
+    """
+
+    def __init__(self, name: str, nlayers: int) -> None:
+        """Initialize pressure profile.
+
+        Parameters
+        ----------
+        name: str
+            Name used in logging
+
+        nlayers: int
+            Number of layers in atmosphere
+
+        """
+        Fittable.__init__(self)
+        Logger.__init__(self, name)
+        self.pressure_profile_levels: npt.NDArray[np.float64] = None
+        if nlayers <= 0:
+            self.error("Number of layers: [%s] should be greater than 0", nlayers)
+            raise ValueError("Number of layers should be at least 1")
+
+        self._nlayers = int(nlayers)
+
+    @property
+    def nLayers(self) -> int:  # noqa: N802
+        """Number of central layers.
+
+        Returns
+        -------
+        int
+        """
+        return self._nlayers
+
+    @property
+    def nLevels(self) -> int:  # noqa: N802
+        """Number of levels (interface between layers)."""
+        return self.nLayers + 1
+
+    def compute_pressure_profile(self) -> None:
+        """Compute pressure profile in Pa.
+
+        **Requires implementation**
+
+        Compute pressure profile and
+        generate pressure array in Pa
+
+        Returns
+        -------
+        pressure_profile: :obj:`array`
+            Pressure profile array in Pa
+
+        """
+        raise NotImplementedError
+
+    @property
+    def profile(self) -> npt.NDArray[np.float64]:
+        """Pressure at each atmospheric layer (Pascal).
+
+        Returns
+        -------
+        pressure_profile : :obj:`array`
+            Pressure profile array in Pa
+        """
+        raise NotImplementedError
+
+    def write(self, output: OutputGroup) -> OutputGroup:
+        """Write pressure profile to output.
+
+        Parameters
+        ----------
+        output : :class:`~taurex.output.output.OutputGroup`
+            Output group to write to.
+
+        Returns
+        -------
+        :class:`~taurex.output.output.OutputGroup`
+
+        """
+        pressure = output.create_group("Pressure")
+        pressure.write_string("pressure_type", self.__class__.__name__)
+        pressure.write_scalar("nlayers", self._nlayers)
+        pressure.write_array("profile", self.profile)
+        return pressure
+
+    @classmethod
+    def input_keywords(cls) -> t.Tuple[str, ...]:
+        """Input keywords for pressure profile."""
+        raise NotImplementedError
+
+
+class SimplePressureProfile(PressureProfile):
+    """A basic pressure profile.
+
+    .. deprecated::
+        Use :class:`LogPressureProfile` instead in new code.
+    """
+
+    WARN = True
+
+    def __init__(
+        self,
+        nlayers: t.Optional[int] = 100,
+        atm_min_pressure: t.Optional[t.Union[float, u.Quantity]] = 1e-4,
+        atm_max_pressure: t.Optional[t.Union[float, u.Quantity]] = 1e6,
+    ):
+        """Initialize pressure profile.
+
+        Parameters
+        ----------
+        nlayers : int
+            Number of layers in atmosphere
+
+        atm_min_pressure : float or astropy.units.Quantity
+            Minimum pressure in Pa when unitless (top of atmosphere).
+
+        atm_max_pressure : float or astropy.units.Quantity
+            Maximum pressure in Pa when unitless (surface of planet).
+
+        """
+        from warnings import warn
+
+        super().__init__("pressure_profile", nlayers)
+        self.pressure_profile = None
+        atm_min_pressure = convert_to_unit_value(
+            atm_min_pressure, u.Pa, default_unit=u.Pa
+        )
+        atm_max_pressure = convert_to_unit_value(
+            atm_max_pressure, u.Pa, default_unit=u.Pa
+        )
+        if self.WARN:
+            warn(
+                "SimplePressureProfile is deprecated. "
+                "Use LogPressureProfile instead",
+                DeprecationWarning,
+            )
+        if atm_max_pressure <= atm_min_pressure:
+            self.error(
+                "Max pressure %1.2e should be greater " "than min pressure %1.2e",
+                atm_max_pressure,
+                atm_min_pressure,
+            )
+            raise ValueError("Max pressure is less than minimum pressure")
+
+        self._atm_min_pressure = atm_min_pressure
+        self._atm_max_pressure = atm_max_pressure
+
+    def compute_pressure_profile(self) -> None:
+        """Set up the pressure profile for the atmosphere model."""
+        self.pressure_profile_levels = np.logspace(
+            math.log10(self._atm_min_pressure),
+            math.log10(self._atm_max_pressure),
+            self.nLevels,
+        )[::-1].astype(get_float_dtype())
+        self.pressure_profile = self.pressure_profile_levels[:-1] * np.sqrt(
+            self.pressure_profile_levels[1:] / self.pressure_profile_levels[:-1]
+        )
+
+    @fitparam(
+        param_name="atm_min_pressure",
+        param_latex=r"$P_\mathrm{min}$",
+        default_mode="log",
+        default_fit=False,
+        default_bounds=[0.1, 1.0],
+    )
+    def minAtmospherePressure(self) -> float:  # noqa: N802
+        """Minimum pressure of atmosphere (top layer) in Pascal."""
+        return self._atm_min_pressure
+
+    @minAtmospherePressure.setter
+    def minAtmospherePressure(  # noqa: N802
+        self, value: t.Union[float, u.Quantity]
+    ) -> None:
+        """Set the minimum pressure of atmosphere (top layer) in Pascal.
+
+        Parameters
+        ----------
+        value : float or astropy.units.Quantity
+            Minimum pressure in Pa when unitless.
+
+        """
+        self._atm_min_pressure = convert_to_unit_value(value, u.Pa, default_unit=u.Pa)
+
+    @fitparam(
+        param_name="atm_max_pressure",
+        param_latex=r"$P_\mathrm{max}$",
+        default_mode="log",
+        default_fit=False,
+        default_bounds=[0.1, 1.0],
+    )
+    def maxAtmospherePressure(self) -> float:  # noqa: N802
+        """Maximum pressure of atmosphere (surface) in Pascal."""
+        return self._atm_max_pressure
+
+    @maxAtmospherePressure.setter
+    def maxAtmospherePressure(  # noqa: N802
+        self, value: t.Union[float, u.Quantity]
+    ) -> None:
+        """Set the maximum pressure of the atmosphere (surface) in Pascal.
+
+        Parameters
+        ----------
+        value : float or astropy.units.Quantity
+            Maximum pressure in Pa when unitless.
+
+        """
+        self._atm_max_pressure = convert_to_unit_value(value, u.Pa, default_unit=u.Pa)
+
+    @property
+    def profile(self) -> npt.NDArray[np.float64]:
+        """Pressure at each atmospheric layer (Pascal)."""
+        return self.pressure_profile
+
+    def write(self, output: OutputGroup) -> OutputGroup:
+        """Write pressure profile to output.
+
+        Parameters
+        ----------
+        output : :class:`~taurex.output.output.OutputGroup`
+            Output group to write to.
+
+        Returns
+        -------
+        :class:`~taurex.output.output.OutputGroup`
+
+        """
+        pressure = super().write(output)
+
+        pressure.write_scalar("atm_max_pressure", self._atm_max_pressure)
+        pressure.write_scalar("atm_min_pressure", self._atm_min_pressure)
+
+        return pressure
+
+    @classmethod
+    def input_keywords(cls) -> t.Tuple[str, ...]:
+        """Input keywords for this pressure profile."""
+        return (
+            "simple",
+            "hydrostatic",
+            "logpressure",
+        )
+
+
+class LogPressureProfile(SimplePressureProfile):
+    """A pressure profile built from a logspace."""
+
+    WARN = False
+    pass

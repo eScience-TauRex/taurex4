@@ -1,0 +1,341 @@
+"""Opacity integration of collision-induced absorption."""
+
+import typing as t
+
+import numpy as np
+import numpy.typing as npt
+
+from taurex.cache import CIACache
+from taurex.model import OneDForwardModel
+from taurex.output import OutputGroup
+from taurex.types import get_float_dtype
+
+from .contribution import Contribution
+
+
+contribute_cia: t.Callable[
+    [
+        int,
+        int,
+        int,
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        int,
+        int,
+        int,
+        npt.NDArray[np.float64],
+    ],
+    npt.NDArray[np.float64],
+] = None
+
+
+def contribute_cia_numpy(
+    startk: int,
+    endk: int,
+    density_offset: int,
+    sigma: npt.NDArray[np.float64],
+    density: npt.NDArray[np.float64],
+    path: npt.NDArray[np.float64],
+    nlayers: int,
+    ngrid: int,
+    layer: int,
+    tau: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    """Integrate the optical depth for a given layer.
+
+    Parameters
+    ----------
+    startk : int
+        Starting layer in integration
+    endk : int
+        Last layer in integration
+    density_offset : int
+        Which part of the density profile to start from
+    sigma : :obj:`array`
+        Cross-section
+    density : array_like
+        Density profile of atmosphere
+    path : array_like
+        Path-length or altitude gradient
+    nlayers : int
+        Total number of layers (unused)
+    ngrid : int
+        Total number of grid points
+    layer : int
+        Which layer we currently on
+    tau : array_like
+        Optical depth (well almost you still need to do
+        ``exp(-tau)`` yourself)
+
+    Returns
+    -------
+    tau : array_like
+        optical depth (well almost you still need to do
+        ``exp(-tau)`` yourself)
+
+    """
+    _path = path[startk:endk]
+    _density = density[startk + density_offset : endk + density_offset]
+    _sigma = sigma[startk + layer : endk + layer, :]
+
+    # einsum avoids the (k, ngrid) intermediate from broadcasting (density^2)
+    d2 = _path * _density * _density
+    tau[layer, :] += np.einsum("ki,k->i", _sigma, d2)
+
+    return tau
+
+
+def contribute_cia_numba(
+    startk: int,
+    endk: int,
+    density_offset: int,
+    sigma: npt.NDArray[np.float64],
+    density: npt.NDArray[np.float64],
+    path: npt.NDArray[np.float64],
+    nlayers: int,
+    ngrid: int,
+    layer: int,
+    tau: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    r"""Collisionally induced absorption integration function.
+
+    This has the form:
+
+    .. math::
+
+        \tau_{\lambda}(z) = \int_{z_{0}}^{z_{1}}
+            \sigma(z') \rho(z')^{2} dz',
+
+    where :math:`z` is the layer, :math:`z_0` and :math:`z_1` are ``startK``
+    and ``endK`` respectively. :math:`\sigma` is the weighted
+    cross-section ``sigma``. :math:`rho` is the ``density`` and
+    :math:`dz'` is the integration path length ``path``
+
+
+    Parameters
+    ----------
+    startk: int
+        starting layer in integration
+
+    endk: int
+        last layer in integration
+
+    density_offset: int
+        Which part of the density profile to start from
+
+    sigma: :obj:`array`
+        cross-section
+
+    density: array_like
+        density profile of atmosphere
+
+    path: array_like
+        path-length or altitude gradient
+
+    nlayers: int
+        Total number of layers (unused)
+
+    ngrid: int
+        total number of grid points
+
+    layer: int
+        Which layer we currently on
+
+    tau : array_like
+        optical depth (well almost you still need to do
+        ``exp(-tau)`` yourself)
+
+    Returns
+    -------
+    tau : array_like
+        optical depth (well almost you still need to do
+        ``exp(-tau)`` yourself)
+
+    """
+    for k in range(startk, endk):
+        _path = path[k]
+        _density = density[k + density_offset]
+        # for mol in range(nmols):
+        for wn in range(ngrid):
+            tau[layer, wn] += sigma[k + layer, wn] * _path * _density * _density
+
+    return tau
+
+
+try:
+    import numba
+
+    contribute_cia = numba.jit(contribute_cia_numba, nopython=True, nogil=True)
+
+except ImportError:
+    # Non numba version.
+    contribute_cia = contribute_cia_numpy
+
+
+class CIAContribution(Contribution):
+    """Computes the CIA contribution to the optical depth.
+
+    CIA is collisionally induced absorption.
+    """
+
+    # The kernel below integrates the pair density, so the cross-section is
+    # weighted by the square of the atmospheric density.
+    density_power = 2
+    _path_matrix_accumulation = True
+
+    def __init__(self, cia_pairs: t.Optional[t.List[str]] = None) -> None:
+        """Initialize CIA.
+
+        Parameters
+        ----------
+        cia_pairs: :obj:`list` of str
+            list of molecule pairs of the form ``mol1-mol2``
+            e.g. ``H2-He``
+
+        """
+        super().__init__("CIA")
+        self._cia_pairs = cia_pairs
+
+        self._cia_cache = CIACache()
+        if self._cia_pairs is None:
+            self._cia_pairs = []
+
+    @property
+    def ciaPairs(self) -> t.Sequence[str]:  # noqa: N802
+        """Returns list of molecular pairs involved.
+
+        Returns
+        -------
+        :obj:`list` of str
+            list of molecule pairs of the form ``mol1-mol2``
+            e.g. ``H2-He``
+        """
+        return self._cia_pairs
+
+    @ciaPairs.setter
+    def ciaPairs(self, value: t.List[str]) -> None:  # noqa: N802
+        """Sets list of molecular pairs involved.
+
+        Parameters
+        ----------
+        value: :obj:`list` of str
+            list of molecule pairs of the form ``mol1-mol2``
+            e.g. ``H2-He``
+
+        """
+        self._cia_pairs = value
+
+    def contribute(
+        self,
+        model: OneDForwardModel,
+        start_layer: int,
+        end_layer: int,
+        density_offset: int,
+        layer: int,
+        density: npt.NDArray[np.float64],
+        tau: npt.NDArray[np.float64],
+        path_length: t.Optional[npt.NDArray[np.float64]] = None,
+    ) -> None:
+        """Integrate the optical depth for a given layer.
+
+        Parameters
+        ----------
+        model : OneDForwardModel
+            The forward model
+        start_layer : int
+            Initial integration layer
+        end_layer : int
+            Final integration layer
+        density_offset : int
+            offset in density layer
+        layer : int
+            atmospheric layer being computed
+        density : npt.NDArray[np.float64]
+            density profile of atmosphere
+        tau : npt.NDArray[np.float64]
+            optical depth to store result
+        path_length : npt.NDArray[np.float64], optional
+            integration length
+
+        """
+        if self._total_cia > 0:
+            contribute_cia(
+                start_layer,
+                end_layer,
+                density_offset,
+                self.sigma_xsec,
+                density,
+                path_length,
+                self._nlayers,
+                self._ngrid,
+                layer,
+                tau,
+            )
+
+    def prepare_each(
+        self, model: OneDForwardModel, wngrid: npt.NDArray[np.float64]
+    ) -> t.Generator[t.Tuple[str, npt.NDArray[np.float64]], None, None]:
+        """Computes and weighs cross-section for a single pair of molecules.
+
+        Parameters
+        ----------
+        model: :class:`~taurex.model.model.ForwardModel`
+            Forward model
+
+        wngrid: :obj:`array`
+            Wavenumber grid
+
+
+        Yields
+        ------
+        component: :obj:`tuple` of type (str, :obj:`array`)
+            Molecular pair and the weighted cia opacity.
+
+        """
+        self._total_cia = len(self.ciaPairs)
+        self._nlayers = model.nLayers
+        self._ngrid = wngrid.shape[0]
+        self.info("Computing CIA ")
+
+        dtype = get_float_dtype()
+
+        chemistry = model.chemistry
+
+        for pair_name in self.ciaPairs:
+            cia = self._cia_cache[pair_name]
+            sigma_cia = np.empty(shape=(model.nLayers, wngrid.shape[0]), dtype=dtype)
+
+            cia_factor = chemistry.get_gas_mix_profile(
+                cia.pairOne
+            ) * chemistry.get_gas_mix_profile(cia.pairTwo)
+
+            for idx_layer, temperature in enumerate(model.temperatureProfile):
+                _cia_xsec = cia.cia(temperature, wngrid)
+                sigma_cia[idx_layer] = _cia_xsec * cia_factor[idx_layer]
+            self.sigma_xsec = sigma_cia
+            yield pair_name, sigma_cia
+
+    def write(self, output: OutputGroup) -> OutputGroup:
+        """Write output to file.
+
+        Parameters
+        ----------
+        output : :class:`~taurex.output.output.OutputGroup`
+            Output group to write to.
+
+        Returns
+        -------
+        :class:`~taurex.output.output.OutputGroup`
+            Output group written to.
+
+        """
+        contrib = super().write(output)
+        if len(self.ciaPairs) > 0:
+            contrib.write_string_array("cia_pairs", self.ciaPairs)
+        return contrib
+
+    @classmethod
+    def input_keywords(cls) -> t.Tuple[str]:
+        """Return list of input keywords for CIA."""
+        return ("CIA",)

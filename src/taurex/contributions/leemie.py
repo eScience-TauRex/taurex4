@@ -1,0 +1,365 @@
+"""Mie scattering using Lee et al. 2013 formalism."""
+
+import typing as t
+
+import numpy as np
+import numpy.typing as npt
+from astropy import units as u
+
+from taurex.data.fittable import fitparam
+from taurex.model import OneDForwardModel
+from taurex.output import OutputGroup
+from taurex.types import get_float_dtype
+from taurex.util import convert_to_unit_value
+
+from .contribution import Contribution
+
+
+if t.TYPE_CHECKING:
+    from taurex.model.model import ForwardModel
+else:
+    ForwardModel = object
+
+from .contribution import contribute_tau
+
+
+class LeeMieContribution(Contribution):
+    """Computes Mie scattering contribution to optica depth.
+
+    Formalism taken from: Lee et al. 2013, ApJ, 778, 97
+
+    Parameters
+    ----------
+    lee_mie_radius: float
+        Particle radius in um
+
+    lee_mie_q: float
+        Extinction coefficient
+
+    lee_mie_mix_ratio: float or astropy.units.Quantity
+        Particle number density in particles/m3
+
+    lee_mie_bottomP: float
+        Bottom of cloud deck in Pa
+
+    lee_mie_topP: float
+        Top of cloud deck in Pa
+
+
+    """
+
+    # The kernel below integrates the cross-section against the path length
+    # alone, passing an array of ones as the density.
+    density_power = 0
+    _path_matrix_accumulation = True
+
+    def contribute(
+        self,
+        model: ForwardModel,
+        start_layer: int,
+        end_layer: int,
+        density_offset: int,
+        layer: int,
+        density: npt.NDArray[np.float64],
+        tau: npt.NDArray[np.float64],
+        path_length: t.Optional[npt.NDArray[np.float64]] = None,
+    ):
+        """Computes an integral for a single layer for the optical depth.
+
+        Parameters
+        ----------
+        model: :class:`~taurex.model.model.ForwardModel`
+            A forward model
+
+        start_layer: int
+            Lowest layer limit for integration
+
+        end_layer: int
+            Upper layer limit of integration
+
+        density_offset: int
+            offset in density layer
+
+        layer: int
+            atmospheric layer being computed
+
+        density: :obj:`array`
+            density profile of atmosphere
+
+        tau: :obj:`array`
+            optical depth to store result
+
+        path_length: :obj:`array`
+            integration length
+
+        """
+        self.debug("SIGMA %s", self.sigma_xsec.shape)
+        self.debug(
+            " %s %s %s %s %s %s %s",
+            start_layer,
+            end_layer,
+            density_offset,
+            layer,
+            1,
+            tau,
+            self._ngrid,
+        )
+        contribute_tau(
+            start_layer,
+            end_layer,
+            density_offset,
+            self.sigma_xsec,
+            np.ones(self._nlayers, dtype=get_float_dtype()),
+            path_length,
+            self._nlayers,
+            self._ngrid,
+            layer,
+            tau,
+        )
+        self.debug("DONE")
+
+    def __init__(
+        self,
+        lee_mie_radius: t.Optional[t.Union[float, u.Quantity]] = 0.01,
+        lee_mie_q: t.Optional[t.Union[float, u.Quantity]] = 40,
+        lee_mie_mix_ratio: t.Optional[t.Union[float, u.Quantity]] = 1e-10,
+        lee_mie_bottomP: t.Optional[t.Union[float, u.Quantity]] = -1,  # noqa: N803
+        lee_mie_topP: t.Optional[t.Union[float, u.Quantity]] = -1,
+    ) -> None:
+        """Initialize LeeMieContribution.
+
+        Parameters
+        ----------
+        lee_mie_radius: float
+            Particle radius in um
+
+        lee_mie_q: float
+            Extinction coefficient
+
+        lee_mie_mix_ratio: float or astropy.units.Quantity
+            Particle number density in particles/m3
+
+        lee_mie_bottomP: float
+            Bottom of cloud deck in Pa
+
+        lee_mie_topP: float
+            Top of cloud deck in Pa
+
+        """
+        super().__init__("Mie")
+
+        self._mie_radius = self._normalize_radius(lee_mie_radius)
+        self._mie_q = self._normalize_dimensionless(lee_mie_q)
+        self._mie_mix = self._normalize_number_density(lee_mie_mix_ratio)
+        self._mie_bottom_pressure = self._normalize_pressure(lee_mie_bottomP)
+        self._mie_top_pressure = self._normalize_pressure(lee_mie_topP)
+
+    @staticmethod
+    def _normalize_radius(value: t.Any) -> t.Any:
+        """Convert a particle radius to plain numeric microns."""
+        return convert_to_unit_value(value, u.um, default_unit=u.um)
+
+    @staticmethod
+    def _normalize_dimensionless(value: t.Any) -> t.Any:
+        """Convert a dimensionless quantity to plain numeric form."""
+        return convert_to_unit_value(
+            value,
+            u.dimensionless_unscaled,
+            default_unit=u.dimensionless_unscaled,
+        )
+
+    @staticmethod
+    def _normalize_number_density(value: t.Any) -> t.Any:
+        """Convert particle number density to plain numeric values in m^-3."""
+        return convert_to_unit_value(value, u.m**-3, default_unit=u.m**-3)
+
+    @staticmethod
+    def _normalize_pressure(value: t.Any) -> t.Any:
+        """Convert pressure to plain numeric values in Pa."""
+        return convert_to_unit_value(value, u.Pa, default_unit=u.Pa)
+
+    @fitparam(
+        param_name="lee_mie_radius",
+        param_latex=r"$R^{lee}_{\mathrm{mie}}$",
+        default_fit=False,
+        default_bounds=[0.01, 0.5],
+    )
+    def mieRadius(self) -> float:  # noqa: N802
+        """Particle radius in um."""
+        return self._mie_radius
+
+    @mieRadius.setter
+    def mieRadius(self, value: t.Union[float, u.Quantity]) -> None:  # noqa: N802
+        """Particle radius in um."""
+        self._mie_radius = self._normalize_radius(value)
+
+    @fitparam(
+        param_name="lee_mie_q",
+        param_latex=r"$Q_\mathrm{ext}$",
+        default_mode="log",
+        default_fit=False,
+        default_bounds=[1e-30, 1e6],
+    )
+    def mieQ(self) -> float:  # noqa: N802
+        """Extinction coefficient."""
+        return self._mie_q
+
+    @mieQ.setter
+    def mieQ(self, value: t.Union[float, u.Quantity]) -> None:  # noqa: N802
+        self._mie_q = self._normalize_dimensionless(value)
+
+    @fitparam(
+        param_name="lee_mie_topP",
+        param_latex=r"$P^{lee}_\mathrm{top}$",
+        default_mode="log",
+        default_fit=False,
+        default_bounds=[1e-30, 1e6],
+    )
+    def mieTopPressure(self) -> float:  # noqa: N802
+        """Pressure at top of cloud deck in Pa."""
+        return self._mie_top_pressure
+
+    @mieTopPressure.setter
+    def mieTopPressure(self, value: t.Union[float, u.Quantity]) -> None:  # noqa: N802
+        """Pressure at top of cloud deck in Pa."""
+        self._mie_top_pressure = self._normalize_pressure(value)
+
+    @fitparam(
+        param_name="lee_mie_bottomP",
+        param_latex=r"$P^{lee}_\mathrm{bottom}$",
+        default_mode="log",
+        default_fit=False,
+        default_bounds=[1e-30, 1e6],
+    )
+    def mieBottomPressure(self) -> float:  # noqa: N802
+        """Pressure at bottom of cloud deck in Pa."""
+        return self._mie_bottom_pressure
+
+    @mieBottomPressure.setter
+    def mieBottomPressure(  # noqa: N802
+        self, value: t.Union[float, u.Quantity]
+    ) -> None:
+        """Pressure at bottom of cloud deck in Pa."""
+        self._mie_bottom_pressure = self._normalize_pressure(value)
+
+    @fitparam(
+        param_name="lee_mie_mix_ratio",
+        param_latex=r"$\chi^{lee}_\mathrm{mie}$",
+        default_mode="log",
+        default_fit=False,
+        default_bounds=[1e-40, 1],
+    )
+    def mieMixing(self) -> float:  # noqa: N802
+        """Particle number density in m^-3."""
+        return self._mie_mix
+
+    @mieMixing.setter
+    def mieMixing(self, value: t.Union[float, u.Quantity]) -> None:  # noqa: N802
+        """Particle number density in m^-3."""
+        self._mie_mix = self._normalize_number_density(value)
+
+    def prepare_each(
+        self, model: OneDForwardModel, wngrid: npt.NDArray[np.float64]
+    ) -> t.Generator[t.Tuple[str, npt.NDArray[np.float64]], None, None]:
+        """Compute and weights the mie opacity for the pressure regions given.
+
+        Parameters
+        ----------
+        model: :class:`~taurex.model.model.ForwardModel`
+            Forward model
+
+        wngrid: :obj:`array`
+            Wavenumber grid
+
+        Yields
+        ------
+        component: :obj:`tuple` of type (str, :obj:`array`)
+            ``Lee`` and the weighted mie opacity.
+
+        """
+        self._nlayers = model.nLayers
+        self._ngrid = wngrid.shape[0]
+
+        pressure_profile = model.pressureProfile
+
+        bottom_pressure = self.mieBottomPressure
+        if bottom_pressure < 0:
+            bottom_pressure = pressure_profile[0]
+
+        top_pressure = self.mieTopPressure
+        if top_pressure < 0:
+            top_pressure = pressure_profile[-1]
+
+        wltmp = 10000 / wngrid
+
+        a = self.mieRadius
+
+        x = 2.0 * np.pi * a / wltmp
+        self.debug("wngrid %s", wngrid)
+        self.debug("x %s", x)
+        q_ext = 5.0 / (self.mieQ * x ** (-4.0) + x ** (0.2))
+
+        sigma_xsec = np.zeros(
+            shape=(self._nlayers, wngrid.shape[0]), dtype=get_float_dtype()
+        )
+
+        # This must transform um to the xsec format in TauREx (m2)
+        am = a * 1e-6
+
+        sigma_mie = q_ext * np.pi * (am**2.0)
+
+        self.debug("q_ext %s", q_ext)
+        self.debug("radius um %s", a)
+        self.debug("sigma %s", sigma_mie)
+
+        self.debug("bottome_pressure %s", bottom_pressure)
+        self.debug("top_pressure %s", top_pressure)
+
+        cloud_filter = (pressure_profile <= bottom_pressure) & (
+            pressure_profile >= top_pressure
+        )
+
+        sigma_xsec[cloud_filter, ...] = sigma_mie * self.mieMixing
+
+        self.sigma_xsec = sigma_xsec
+
+        self.debug("final xsec %s", self.sigma_xsec)
+
+        yield "Lee", sigma_xsec
+
+    def write(self, output: OutputGroup) -> OutputGroup:
+        """Write output group.
+
+        Parameters
+        ----------
+        output: :class:`~taurex.output.output.Output`
+            Output object to write to
+        """
+        contrib = super().write(output)
+        contrib.write_scalar("lee_mie_radius", self._mie_radius)
+        contrib.write_scalar("lee_mie_q", self._mie_q)
+        contrib.write_scalar("lee_mie_mix_ratio", self._mie_mix)
+        contrib.write_scalar("lee_mie_bottomP", self._mie_bottom_pressure)
+        contrib.write_scalar("lee_mie_topP", self._mie_top_pressure)
+        return contrib
+
+    @classmethod
+    def input_keywords(cls) -> t.Tuple[str]:
+        """Input keywords."""
+        return ("LeeMie",)
+
+    BIBTEX_ENTRIES = [
+        """
+        @article{Lee_2013,
+            doi = {10.1088/0004-637x/778/2/97},
+            url = {https://doi.org/10.1088%2F0004-637x%2F778%2F2%2F97},
+            year = 2013,
+            month = {nov},
+            publisher = {{IOP} Publishing},
+            volume = {778},
+            number = {2},
+            pages = {97},
+            author = {Jae-Min Lee and Kevin Heng and Patrick G. J. Irwin},
+            journal = {The Astrophysical Journal},
+        """,
+    ]

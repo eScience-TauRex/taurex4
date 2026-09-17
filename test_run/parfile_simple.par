@@ -1,0 +1,88 @@
+## Simple retrieval, inspired from the examples provided with the TauREx code.
+
+[Global]
+xsec_path = ./xsec_R1k
+cia_path = ./cia
+mpi_use_shared = True
+
+[Chemistry]
+chemistry_type = free
+fill_gases = H2, He
+ratio = 0.172
+
+    [[H2O]]
+    gas_type = constant
+    mix_ratio = 1e-5
+
+    [[CO2]]
+    gas_type = constant
+    mix_ratio = 1e-5
+
+
+[Temperature]
+profile_type = isothermal
+T = 800.
+
+[Pressure]
+profile_type = simple
+atm_min_pressure = 1e-2
+atm_max_pressure = 1e6
+nlayers = 80
+
+[Planet]
+planet_type = simple
+planet_mass = 0.12
+planet_radius = 0.82
+
+[Star]
+star_type = blackbody
+radius = 0.676
+temperature = 6400.
+
+[Model]
+model_type = transmission
+
+    [[Absorption]]
+	
+    [[Rayleigh]]
+	
+    [[CIA]]
+    cia_pairs= H2-H2, H2-He
+
+    [[FlatMie]]
+    flat_mix_ratio = 1000
+    flat_topP = 1e2  
+    
+[Observation]
+observed_spectrum = WFC3_G141_Fiducial_Pegasus_Spectrum.txt
+
+[Optimizer]
+
+optimizer = multinest
+num_live_points = 302
+evidence_tolerance = 0.5
+resume=True
+verbose_output= True
+search_multi_modes = False
+multi_nest_path = multi
+n_iter_before_update=20
+sigma_fraction = 0.2
+max_iterations=0
+
+[Fitting]
+
+planet_radius:fit = True
+planet_radius:bounds = 0.5, 1.5
+
+T:fit = True
+T:bounds = 200, 3000
+
+H2O:fit = True
+H2O:bounds = 1e-12, 1e-1
+
+CO2:fit = True
+CO2:bounds = 1e-12, 1e-1
+
+flat_topP:fit = True
+flat_topP:bounds = 1e6, 1e-2
+flat_topP:mode = log

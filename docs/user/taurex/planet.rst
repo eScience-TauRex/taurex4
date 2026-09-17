@@ -1,0 +1,62 @@
+.. _userplanet:
+
+============
+``[Planet]``
+============
+
+This header is used to define planetary properties. Currently, only ``planet_type = simple``
+is supported and must be included. ``planet_type = custom`` is also valid, See :ref:`customtypes`
+
+:Class: :class:`~taurex.data.planet.Planet`
+
+--------
+Keywords
+--------
+
++---------------------+--------------+--------------------------+---------+
+| Variable            | Type         | Description              | Default |
++---------------------+--------------+--------------------------+---------+
+| ``planet_mass``     | :obj:`float` | Mass in Jupiter mass     | 1.0     |
++---------------------+--------------+--------------------------+---------+
+| ``planet_radius``   | :obj:`float` | Radius in Jupiter radius | 1.0     |
++---------------------+--------------+--------------------------+---------+
+| ``planet_distance`` | :obj:`float` | Semi-major-axis in AU    | 1.0     |
++---------------------+--------------+--------------------------+---------+
+| ``impact_param``    | :obj:`float` | Impact parameter         | 0.5     |
++---------------------+--------------+--------------------------+---------+
+| ``orbital_period``  | :obj:`float` | Orbital period in days   | 2.0     |
++---------------------+--------------+--------------------------+---------+
+| ``albedo``          | :obj:`float` | Planetary albedo         | 0.3     |
++---------------------+--------------+--------------------------+---------+
+| ``transit_time``    | :obj:`float` | Transit time in seconds  | 3000.0  |
++---------------------+--------------+--------------------------+---------+
+
+Physical quantities are normalized to the documented units. For example,
+``48 * u.hour`` is stored as an orbital period of two days and
+``50 * u.min`` as a transit time of 3000 seconds. Impact parameter and albedo
+accept dimensionless quantities such as percentages.
+
+------------------
+Fitting Parameters
+------------------
+
++---------------------+--------------+--------------------------+
+| Parameter           | Type         | Description              |
++---------------------+--------------+--------------------------+
+| ``planet_mass``     | :obj:`float` | Mass in Jupiter mass     |
++---------------------+--------------+--------------------------+
+| ``planet_radius``   | :obj:`float` | Radius in Jupiter radius |
++---------------------+--------------+--------------------------+
+| ``planet_distance`` | :obj:`float` | Semi-major-axis in AU    |
++---------------------+--------------+--------------------------+
+
+
+Examples
+--------
+
+Planet with 1.5 Jupiter mass and 1.2 Jupiter radii::
+
+    [Planet]
+    planet_type = simple
+    planet_mass = 1.5
+    planet_radius = 1.2
