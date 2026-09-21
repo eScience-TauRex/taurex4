@@ -64,6 +64,10 @@ def data_path(tmp_path):
         )
 
     GlobalCache()["mpi_use_shared"] = False
+    # The differentiable model only implements cross-section opacities, and the
+    # opacity method is global state that an earlier test can leave on ktables,
+    # so it is pinned here rather than inherited from whatever ran before.
+    GlobalCache()["opacity_method"] = "xsec"
     opacity_cache = OpacityCache()
     opacity_cache.clear_cache()
     opacity_cache.set_opacity_path(str(tmp_path))
@@ -89,9 +93,24 @@ def observation():
     return ArraySpectrum(np.vstack([wavelength, data, error, width]).T)
 
 
-@pytest.fixture
-def taurex_model(data_path, observation):
-    """A small transmission model using the synthetic opacities."""
+def build_model(temperature_profile=None):
+    """Build the small transmission model.
+
+    The temperature profile has to be chosen before the model is built, because
+    the fitting parameters of a profile are compiled into the model when it is
+    built and swapping the profile afterwards leaves that list stale.
+
+    Parameters
+    ----------
+    temperature_profile:
+        Temperature profile to use, isothermal at 900 K by default
+
+    Returns
+    -------
+    :class:`taurex.model.TransmissionModel`
+        The built model
+
+    """
     from taurex.contributions import AbsorptionContribution
     from taurex.contributions import CIAContribution
     from taurex.contributions import FlatMieContribution
@@ -106,13 +125,16 @@ def taurex_model(data_path, observation):
     chemistry = TaurexChemistry(fill_gases=["H2", "He"], ratio=0.172)
     chemistry.addGas(ConstantGas("H2O", mix_ratio=1e-4))
 
+    if temperature_profile is None:
+        temperature_profile = Isothermal(T=900.0)
+
     model = TransmissionModel(
         planet=Planet(planet_mass=0.74, planet_radius=1.38),
         star=BlackbodyStar(temperature=6000.0, radius=1.16),
         pressure_profile=SimplePressureProfile(
             nlayers=30, atm_min_pressure=1e-2, atm_max_pressure=1e6
         ),
-        temperature_profile=Isothermal(T=900.0),
+        temperature_profile=temperature_profile,
         chemistry=chemistry,
     )
     model.add_contribution(AbsorptionContribution())
@@ -123,6 +145,12 @@ def taurex_model(data_path, observation):
     )
     model.model()
     return model
+
+
+@pytest.fixture
+def taurex_model(data_path, observation):
+    """A small transmission model using the synthetic opacities."""
+    return build_model()
 
 
 def compile_fit_params(model, observation, names):

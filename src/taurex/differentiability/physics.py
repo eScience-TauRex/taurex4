@@ -1,27 +1,31 @@
 """Differentiable building blocks of the TauREx transmission forward model.
 
-Every routine here works on ``torch`` tensors so that one call to
-``backward()`` walks the entire atmosphere. The routines mirror the
+Every routine works on ``jax`` arrays so that one call to :func:`jax.grad`
+walks the entire atmosphere, and every routine is traceable so the forward model
+can be compiled as a whole with :func:`jax.jit`. The routines mirror the
 corresponding numpy implementations in :mod:`taurex.util` and
 :class:`taurex.model.transmission.TransmissionModel` closely enough to
 reproduce their output, but the index lookups that ``searchsorted`` performs
 are detached so only the interpolation weights carry gradients.
+
+JAX arrays are immutable, so nothing is written in place: the single place
+where the numpy code fills a buffer uses a functional ``.at[].set``, and the
+hydrostatic recursion - which the numpy code runs as a python loop - is a
+:func:`jax.lax.scan`, so the compiled program contains a loop rather than
+``nlayers`` unrolled copies of it.
 """
 
 import typing as t
 
-import torch
+import jax
+import jax.numpy as jnp
 
 
-FloatTensor = torch.Tensor
+Array = jax.Array
 
 
-def as_tensor(
-    value: t.Any,
-    dtype: torch.dtype = torch.float64,
-    device: t.Optional[torch.device] = None,
-) -> FloatTensor:
-    """Convert a python/array value to a tensor of the working dtype.
+def as_array(value: t.Any, dtype: jnp.dtype = jnp.float64) -> Array:
+    """Convert a python/array value to an array of the working dtype.
 
     Parameters
     ----------
@@ -31,24 +35,25 @@ def as_tensor(
     dtype:
         Floating point dtype to use
 
-    device:
-        Device to place the tensor on
-
     Returns
     -------
-    :obj:`torch.Tensor`
-        Converted tensor
+    :obj:`jax.Array`
+        Converted array
 
     """
-    return torch.as_tensor(value, dtype=dtype, device=device)
+    return jnp.asarray(value, dtype=dtype)
 
 
-def find_closest_pair(x: FloatTensor, value: FloatTensor) -> t.Tuple[FloatTensor, FloatTensor]:
+def find_closest_pair(x: Array, value: Array) -> t.Tuple[Array, Array]:
     """Find the indices either side of ``value`` in the sorted array ``x``.
 
     Port of :func:`taurex.util.find_closest_pair`. The result is clipped so
     that both indices are always valid, which is what the numpy version does
     for values outside the grid.
+
+    Both indices are integer valued, so they can only ever contribute a zero
+    derivative; ``stop_gradient`` states that explicitly and keeps the
+    interpolation weights the only differentiable path.
 
     Parameters
     ----------
@@ -64,33 +69,33 @@ def find_closest_pair(x: FloatTensor, value: FloatTensor) -> t.Tuple[FloatTensor
         Indices with ``x[left] <= value <= x[right]``
 
     """
-    right = torch.searchsorted(x.detach(), value.detach())
-    right = right.clamp(1, x.shape[0] - 1)
-    left = (right - 1).clamp(min=0)
+    right = jnp.searchsorted(x, jax.lax.stop_gradient(value))
+    right = jnp.clip(right, 1, x.shape[0] - 1)
+    left = jnp.clip(right - 1, 0, x.shape[0] - 1)
     return left, right
 
 
-def _safe_ratio(numerator: FloatTensor, denominator: FloatTensor) -> FloatTensor:
+def _safe_ratio(numerator: Array, denominator: Array) -> Array:
     """Divide, replacing a zero denominator with one."""
-    return numerator / torch.where(
+    return numerator / jnp.where(
         denominator == 0,
-        torch.ones_like(denominator),
+        jnp.ones_like(denominator),
         denominator,
     )
 
 
 def interp_bilin(
-    x11: FloatTensor,
-    x12: FloatTensor,
-    x21: FloatTensor,
-    x22: FloatTensor,
-    temperature: FloatTensor,
-    temperature_min: FloatTensor,
-    temperature_max: FloatTensor,
-    pressure: FloatTensor,
-    pressure_min: FloatTensor,
-    pressure_max: FloatTensor,
-) -> FloatTensor:
+    x11: Array,
+    x12: Array,
+    x21: Array,
+    x22: Array,
+    temperature: Array,
+    temperature_min: Array,
+    temperature_max: Array,
+    pressure: Array,
+    pressure_min: Array,
+    pressure_max: Array,
+) -> Array:
     """Bilinear interpolation, matching :func:`taurex.util.math.intepr_bilin`.
 
     Parameters
@@ -113,7 +118,7 @@ def interp_bilin(
 
     Returns
     -------
-    :obj:`torch.Tensor`
+    :obj:`jax.Array`
         Interpolated values
 
     """
@@ -131,24 +136,24 @@ def interp_bilin(
 
 
 def interp_lin(
-    x11: FloatTensor,
-    x12: FloatTensor,
-    pressure: FloatTensor,
-    pressure_min: FloatTensor,
-    pressure_max: FloatTensor,
-) -> FloatTensor:
+    x11: Array,
+    x12: Array,
+    pressure: Array,
+    pressure_min: Array,
+    pressure_max: Array,
+) -> Array:
     """Linear pressure interpolation, matching :func:`taurex.util.math.interp_lin_only`."""
     scale = _safe_ratio(pressure - pressure_min, pressure_max - pressure_min)
     return x11 - scale * (x11 - x12)
 
 
 def interp_exp_only(
-    x11: FloatTensor,
-    x12: FloatTensor,
-    temperature: FloatTensor,
-    temperature_min: FloatTensor,
-    temperature_max: FloatTensor,
-) -> FloatTensor:
+    x11: Array,
+    x12: Array,
+    temperature: Array,
+    temperature_min: Array,
+    temperature_max: Array,
+) -> Array:
     """Exponential temperature interpolation.
 
     Matches :func:`taurex.util.math.interp_exp_only`.
@@ -166,30 +171,30 @@ def interp_exp_only(
 
     Returns
     -------
-    :obj:`torch.Tensor`
+    :obj:`jax.Array`
         Interpolated values
 
     """
-    return x11 * torch.exp(
+    return x11 * jnp.exp(
         _safe_ratio(
-            temperature_max * (temperature_min - temperature) * torch.log(x11 / x12),
+            temperature_max * (temperature_min - temperature) * jnp.log(x11 / x12),
             temperature * (temperature_max - temperature_min),
         )
     )
 
 
 def interp_exp_and_lin(
-    x11: FloatTensor,
-    x12: FloatTensor,
-    x21: FloatTensor,
-    x22: FloatTensor,
-    temperature: FloatTensor,
-    temperature_min: FloatTensor,
-    temperature_max: FloatTensor,
-    pressure: FloatTensor,
-    pressure_min: FloatTensor,
-    pressure_max: FloatTensor,
-) -> FloatTensor:
+    x11: Array,
+    x12: Array,
+    x21: Array,
+    x22: Array,
+    temperature: Array,
+    temperature_min: Array,
+    temperature_max: Array,
+    pressure: Array,
+    pressure_min: Array,
+    pressure_max: Array,
+) -> Array:
     """Exp-in-temperature, linear-in-pressure interpolation.
 
     Matches :func:`taurex.util.math.interp_exp_and_lin`.
@@ -214,7 +219,7 @@ def interp_exp_and_lin(
 
     Returns
     -------
-    :obj:`torch.Tensor`
+    :obj:`jax.Array`
         Interpolated values
 
     """
@@ -223,11 +228,11 @@ def interp_exp_and_lin(
     high = x12 * pressure_diff - (pressure - pressure_min) * (x12 - x22)
     return (
         low
-        * torch.exp(
+        * jnp.exp(
             _safe_ratio(
                 temperature_max
                 * (temperature_min - temperature)
-                * torch.log(_safe_ratio(low, high)),
+                * jnp.log(_safe_ratio(low, high)),
                 temperature * (temperature_max - temperature_min),
             )
         )
@@ -235,10 +240,10 @@ def interp_exp_and_lin(
     )
 
 
-def boxcar(a: FloatTensor, n: int) -> FloatTensor:
+def boxcar(a: Array, n: int) -> Array:
     """Moving average with window ``n``.
 
-    Port of :func:`taurex.util.movingaverage` that keeps the autograd graph
+    Port of :func:`taurex.util.movingaverage` that keeps the autodiff graph
     intact instead of writing into the cumulative sum in place.
 
     Parameters
@@ -251,27 +256,27 @@ def boxcar(a: FloatTensor, n: int) -> FloatTensor:
 
     Returns
     -------
-    :obj:`torch.Tensor`
+    :obj:`jax.Array`
         Smoothed array of length ``len(a) - n + 1``
 
     """
     if n < 1:
         raise ValueError(f"Window size must be at least 1, got {n}")
-    zero = torch.zeros(1, dtype=a.dtype, device=a.device)
-    cumulative = torch.cat([zero, torch.cumsum(a, dim=0)])
+    zero = jnp.zeros(1, dtype=a.dtype)
+    cumulative = jnp.concatenate([zero, jnp.cumsum(a, axis=0)])
     return (cumulative[n:] - cumulative[:-n]) / n
 
 
 def linear_interp_nd(
-    x: FloatTensor,
-    xp: FloatTensor,
-    fp: FloatTensor,
-) -> FloatTensor:
+    x: Array,
+    xp: Array,
+    fp: Array,
+) -> Array:
     """Piecewise linear interpolation with edge clamping.
 
     Reproduces :func:`numpy.interp` for ``x`` against nodes ``xp`` with values
     ``fp``. The knot positions are only used to pick the bracketing pair and
-    to form the interpolation weight, so ``fp`` may require grad.
+    to form the interpolation weight, so ``fp`` may carry a gradient.
 
     Parameters
     ----------
@@ -286,42 +291,54 @@ def linear_interp_nd(
 
     Returns
     -------
-    :obj:`torch.Tensor`
+    :obj:`jax.Array`
         Interpolated values, shape ``(n,)`` or ``(n, k)``
 
     """
     n_nodes = xp.shape[0]
-    upper = torch.searchsorted(xp.detach(), x.detach(), right=True).clamp(1, n_nodes - 1)
+    upper = jnp.clip(
+        jnp.searchsorted(
+            jax.lax.stop_gradient(xp), jax.lax.stop_gradient(x), side="right"
+        ),
+        1,
+        n_nodes - 1,
+    )
     lower = upper - 1
 
     x_lo = xp[lower]
     x_hi = xp[upper]
     weight = _safe_ratio(x - x_lo, x_hi - x_lo).reshape(
-        x.shape + (1,) * (fp.dim() - 1)
+        x.shape + (1,) * (fp.ndim - 1)
     )
 
     y_lo = fp[lower]
     y_hi = fp[upper]
     result = y_lo + weight * (y_hi - y_lo)
 
-    result = torch.where((x <= xp[0]).reshape(x.shape + (1,) * (fp.dim() - 1)), fp[0], result)
-    result = torch.where(
-        (x >= xp[-1]).reshape(x.shape + (1,) * (fp.dim() - 1)), fp[-1], result
-    )
+    shape = x.shape + (1,) * (fp.ndim - 1)
+    result = jnp.where((x <= xp[0]).reshape(shape), fp[0], result)
+    result = jnp.where((x >= xp[-1]).reshape(shape), fp[-1], result)
     return result
 
 
 def npoint_temperature(
-    pressure_profile: FloatTensor,
-    pressure_nodes: FloatTensor,
-    temperature_nodes: FloatTensor,
+    pressure_profile: Array,
+    pressure_nodes: Array,
+    temperature_nodes: Array,
     smooth_window: int,
-) -> FloatTensor:
+) -> Array:
     """Temperature profile from user points, smoothed.
 
     Port of :meth:`taurex.data.profiles.temperature.npoint.NPoint.profile`.
     The pressure nodes and temperature nodes are ordered from the surface to
     the top of the atmosphere, as they are in the numpy implementation.
+
+    The numpy version returns a constant profile when every node temperature is
+    the same. That test looks at the values themselves rather than at their
+    shapes, so under tracing it is a :func:`jax.numpy.where` rather than a
+    python ``if``; the interpolation it guards against is written with
+    :func:`_safe_ratio` so that the discarded branch is finite and its
+    gradient stays finite too.
 
     Parameters
     ----------
@@ -339,16 +356,15 @@ def npoint_temperature(
 
     Returns
     -------
-    :obj:`torch.Tensor`
+    :obj:`jax.Array`
         Temperature at each layer centre in K
 
     """
-    if torch.all(temperature_nodes == temperature_nodes[0]):
-        return torch.ones_like(pressure_profile) * temperature_nodes[0]
+    isothermal = jnp.all(temperature_nodes == temperature_nodes[0])
 
-    log_pressure = torch.log10(pressure_profile.flip(0))
-    log_nodes = torch.log10(pressure_nodes.flip(0))
-    nodes = temperature_nodes.flip(0)
+    log_pressure = jnp.log10(pressure_profile[::-1])
+    log_nodes = jnp.log10(pressure_nodes[::-1])
+    nodes = temperature_nodes[::-1]
 
     profile = linear_interp_nd(log_pressure, log_nodes, nodes)
 
@@ -360,29 +376,36 @@ def npoint_temperature(
     smoothed = boxcar(profile, window)
     border = int((profile.shape[0] - smoothed.shape[0]) / 2)
 
-    reversed_profile = profile.flip(0)
+    reversed_profile = profile[::-1]
     if smoothed.shape[0] == reversed_profile.shape[0]:
-        return smoothed.flip(0)
+        flat = smoothed[::-1]
+    else:
+        flat = reversed_profile.at[border : reversed_profile.shape[0] - border].set(
+            smoothed[::-1]
+        )
 
-    result = reversed_profile.clone()
-    result[border : result.shape[0] - border] = smoothed.flip(0)
-    return result
+    return jnp.where(
+        isothermal,
+        jnp.ones_like(pressure_profile) * temperature_nodes[0],
+        flat,
+    )
 
 
 def altitude_gravity_scaleheight(
-    planet_radius: FloatTensor,
-    planet_mass: FloatTensor,
-    temperature: FloatTensor,
-    mu: FloatTensor,
-    pressure_levels: FloatTensor,
-) -> FloatTensor:
+    planet_radius: Array,
+    planet_mass: Array,
+    temperature: Array,
+    mu: Array,
+    pressure_levels: Array,
+) -> t.Tuple[Array, Array, Array, Array]:
     r"""Solve the hydrostatic profile for altitude, gravity and layer thickness.
 
     Port of :meth:`taurex.data.planet.BasePlanet.calculate_scale_properties`.
     The layer thickness at each boundary depends on the scale height of the
     layer below it, which in turn depends on the altitude below it, so the
     recursion cannot be vectorised without a scan. ``nlayers`` is of order one
-    hundred, so the python loop is left in place.
+    hundred, so a :func:`jax.lax.scan` is used: the compiled program holds one
+    copy of the step rather than ``nlayers`` of them.
 
     Parameters
     ----------
@@ -419,40 +442,42 @@ def altitude_gravity_scaleheight(
     from taurex.constants import G, KBOLTZ
 
     n_layers = temperature.shape[0]
-    zero = torch.zeros((), dtype=temperature.dtype, device=temperature.device)
+    zero = jnp.zeros((), dtype=temperature.dtype)
 
     surface_gravity = (G * planet_mass) / planet_radius**2
-    scaleheight = [(KBOLTZ * temperature[0]) / (mu[0] * surface_gravity)]
-    gravity = [surface_gravity]
-    altitude = [zero]
-    deltaz = [zero]
+    first_scaleheight = (KBOLTZ * temperature[0]) / (mu[0] * surface_gravity)
 
-    # Written with lists rather than in-place assignment into preallocated
-    # tensors: the recursion reads altitude[i - 1] and writes altitude[i], and
-    # autograd refuses in-place updates to a tensor it still needs.
-    for i in range(1, n_layers + 1):
-        step = -scaleheight[i - 1] * torch.log(
-            pressure_levels[i] / pressure_levels[i - 1]
+    def step(carry, index):
+        """Advance the recursion by one layer."""
+        altitude_below, scaleheight_below = carry
+        deltaz = -scaleheight_below * jnp.log(
+            pressure_levels[index] / pressure_levels[index - 1]
         )
-        deltaz.append(step)
-        altitude.append(altitude[i - 1] + step)
-        if i < n_layers:
-            gravity.append((G * planet_mass) / (planet_radius + altitude[i]) ** 2)
-            scaleheight.append((KBOLTZ * temperature[i]) / (mu[i] * gravity[i]))
+        altitude = altitude_below + deltaz
+        # There is no layer above the last boundary, so the gravity and scale
+        # height computed for it are dropped when the outputs are assembled.
+        within = jnp.clip(index, 0, n_layers - 1)
+        gravity = (G * planet_mass) / (planet_radius + altitude) ** 2
+        scaleheight = (KBOLTZ * temperature[within]) / (mu[within] * gravity)
+        return (altitude, scaleheight), (deltaz, altitude, gravity, scaleheight)
+
+    _, (deltaz, upper_altitude, upper_gravity, upper_scaleheight) = jax.lax.scan(
+        step, (zero, first_scaleheight), jnp.arange(1, n_layers + 1)
+    )
 
     return (
-        torch.stack(altitude),
-        torch.stack(scaleheight),
-        torch.stack(gravity),
-        torch.stack(deltaz[1:]),
+        jnp.concatenate([jnp.zeros((1,), dtype=temperature.dtype), upper_altitude]),
+        jnp.concatenate([first_scaleheight[None], upper_scaleheight[:-1]]),
+        jnp.concatenate([surface_gravity[None], upper_gravity[:-1]]),
+        deltaz,
     )
 
 
 def path_matrix(
-    altitude: FloatTensor,
-    deltaz: FloatTensor,
-    planet_radius: FloatTensor,
-) -> FloatTensor:
+    altitude: Array,
+    deltaz: Array,
+    planet_radius: Array,
+) -> Array:
     r"""Chord length through every layer for every tangent ray.
 
     Port of :meth:`taurex.model.transmission.TransmissionModel.compute_path_matrix`.
@@ -473,7 +498,7 @@ def path_matrix(
 
     Returns
     -------
-    :obj:`torch.Tensor`
+    :obj:`jax.Array`
         Path-length matrix, shape ``(nlayers, nlayers)``
 
     """
@@ -484,33 +509,31 @@ def path_matrix(
 
     # u[q] = z[q] + dz[q] / 2, padded so the broadcast index layer + j stays
     # inside the array.
-    u = torch.cat(
+    u = jnp.concatenate(
         [
             altitude + deltaz / 2.0,
-            torch.zeros(n_layers - 1, dtype=altitude.dtype, device=altitude.device),
+            jnp.zeros(n_layers - 1, dtype=altitude.dtype),
         ]
     )
 
-    layer = torch.arange(n_layers, device=altitude.device)[:, None]
-    index = layer + torch.arange(n_layers, device=altitude.device)[None, :]
+    layer = jnp.arange(n_layers)[:, None]
+    index = layer + jnp.arange(n_layers)[None, :]
 
     defined = index < n_layers
     p = (c0 + altitude) ** 2
-    argument = torch.where(
-        defined, (c0 + u[index]) ** 2 - p[:, None], torch.ones_like(p[:, None])
+    argument = jnp.where(
+        defined, (c0 + u[index]) ** 2 - p[:, None], jnp.ones_like(p[:, None])
     )
-    b = torch.where(defined, torch.sqrt(argument), torch.zeros_like(argument))
+    b = jnp.where(defined, jnp.sqrt(argument), jnp.zeros_like(argument))
 
-    padded = torch.cat(
-        [torch.zeros(n_layers, 1, dtype=b.dtype, device=b.device), b], dim=1
-    )
+    padded = jnp.concatenate([jnp.zeros((n_layers, 1), dtype=b.dtype), b], axis=1)
 
     # The segment between boundaries m and m + 1 contributes
     # 2 * (b[layer, m - layer] - b[layer, m - layer - 1]), and padded[:, k] is
     # b[:, k - 1], so one gather of each array at the shifted index gives both
     # terms.
-    m = torch.arange(n_layers, device=altitude.device)[None, :]
-    offset = (m - layer).clamp(0, n_layers - 1)
-    current = torch.gather(b, 1, offset)
-    previous = torch.gather(padded, 1, offset)
-    return torch.where(m >= layer, 2.0 * (current - previous), torch.zeros_like(b))
+    m = jnp.arange(n_layers)[None, :]
+    offset = jnp.clip(m - layer, 0, n_layers - 1)
+    current = jnp.take_along_axis(b, offset, axis=1)
+    previous = jnp.take_along_axis(padded, offset, axis=1)
+    return jnp.where(m >= layer, 2.0 * (current - previous), jnp.zeros_like(b))

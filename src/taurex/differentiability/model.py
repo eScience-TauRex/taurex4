@@ -1,20 +1,35 @@
-"""Differentiable PyTorch port of the TauREx transmission forward model.
+"""Differentiable JAX port of the TauREx transmission forward model.
 
 The module mirrors the numpy pipeline that
-:class:`taurex.model.transmission.TransmissionModel` implements, but every
-stage is expressed as torch tensor operations, so a single ``backward()``
-returns the gradient of the spectrum with respect to all fitting parameters.
+:class:`taurex.model.transmission.TransmissionModel` implements, but every stage
+is expressed as ``jax.numpy`` operations, so a single :func:`jax.grad` returns
+the gradient of the spectrum with respect to all fitting parameters and
+:func:`jax.jit` can compile the whole forward pass into one program.
 
 The taurex objects remain the source of truth: profiles, gases, contributions,
 priors and bounds all come from the object graph the input file built, and the
 opacity tables are the very same arrays the numpy model uses. Only the
-arithmetic is re-expressed in torch.
+arithmetic is re-expressed in JAX.
+
+Two choices matter for a compiled forward pass, and both are deliberate:
+
+* the flat cloud deck selects its layer window with a mask over traced
+  ``searchsorted`` bounds instead of a python slice, because a slice needs
+  concrete integers and would force a re-trace whenever the cloud top moves;
+* the layer state is threaded through with :func:`jax.lax.scan` in
+  :mod:`taurex.differentiability.physics` rather than a python loop.
+
+Everything the model reads - pressure grid, opacity tables, binning matrix,
+observed spectrum - is static for the lifetime of the object, so it is captured
+as a compile-time constant the first time the objective is traced and never
+transferred again.
 """
 
 import typing as t
 
 import numpy as np
-import torch
+import jax
+import jax.numpy as jnp
 
 from taurex.contributions import AbsorptionContribution
 from taurex.contributions import CIAContribution
@@ -26,7 +41,7 @@ from taurex.types import get_float_dtype
 from . import physics
 
 
-FloatTensor = torch.Tensor
+Array = jax.Array
 
 
 class GridResampler:
@@ -53,10 +68,7 @@ class GridResampler:
         :meth:`taurex.opacity.opacity.Opacity.opacity`.
 
     dtype:
-        Floating point dtype of the working tensors
-
-    device:
-        Device of the working tensors
+        Floating point dtype of the working arrays
 
     subset:
         Optional index array selecting the part of ``source`` that the caller
@@ -70,8 +82,7 @@ class GridResampler:
         source: np.ndarray,
         target: np.ndarray,
         hold: bool,
-        dtype: torch.dtype,
-        device: torch.device,
+        dtype: jnp.dtype,
         subset: t.Optional[np.ndarray] = None,
     ) -> None:
         """Initialise the resampler.
@@ -88,10 +99,7 @@ class GridResampler:
             Edge behaviour for targets outside the source range
 
         dtype:
-            Floating point dtype of the working tensors
-
-        device:
-            Device of the working tensors
+            Floating point dtype of the working arrays
 
         subset:
             Optional index array selecting part of ``source``
@@ -117,13 +125,13 @@ class GridResampler:
         lower = upper - 1
         weight = (target - source[lower]) / (source[upper] - source[lower])
 
-        self._lower = torch.as_tensor(lower, dtype=torch.int64, device=device)
-        self._upper = torch.as_tensor(upper, dtype=torch.int64, device=device)
-        self._weight = torch.as_tensor(weight, dtype=dtype, device=device)
-        self._below = torch.as_tensor(target < source[0], device=device)
-        self._above = torch.as_tensor(target > source[-1], device=device)
+        self._lower = jnp.asarray(lower, dtype=jnp.int32)
+        self._upper = jnp.asarray(upper, dtype=jnp.int32)
+        self._weight = jnp.asarray(weight, dtype=dtype)
+        self._below = jnp.asarray(target < source[0])
+        self._above = jnp.asarray(target > source[-1])
 
-    def apply(self, values: FloatTensor) -> FloatTensor:
+    def apply(self, values: Array) -> Array:
         """Resample ``values`` along its last axis.
 
         Parameters
@@ -133,38 +141,38 @@ class GridResampler:
 
         Returns
         -------
-        :obj:`torch.Tensor`
+        :obj:`jax.Array`
             Array whose last axis is the target grid
 
         """
         if self.identity:
             return values
 
-        weight = self._weight.reshape((1,) * (values.dim() - 1) + (-1,))
-        lower = values.index_select(-1, self._lower)
-        upper = values.index_select(-1, self._upper)
+        weight = self._weight.reshape((1,) * (values.ndim - 1) + (-1,))
+        lower = jnp.take(values, self._lower, axis=-1)
+        upper = jnp.take(values, self._upper, axis=-1)
         result = lower + weight * (upper - lower)
 
-        shape = (1,) * (values.dim() - 1) + (-1,)
+        shape = (1,) * (values.ndim - 1) + (-1,)
         if self.hold:
-            low_fill = values[..., :1].expand_as(result)
-            high_fill = values[..., -1:].expand_as(result)
+            low_fill = jnp.broadcast_to(values[..., :1], result.shape)
+            high_fill = jnp.broadcast_to(values[..., -1:], result.shape)
         else:
-            low_fill = torch.zeros_like(result)
-            high_fill = torch.zeros_like(result)
+            low_fill = jnp.zeros_like(result)
+            high_fill = jnp.zeros_like(result)
 
-        result = torch.where(self._below.reshape(shape), low_fill, result)
-        return torch.where(self._above.reshape(shape), high_fill, result)
+        result = jnp.where(self._below.reshape(shape), low_fill, result)
+        return jnp.where(self._above.reshape(shape), high_fill, result)
 
 
 def interp_temperature(
-    x_low: FloatTensor,
-    x_high: FloatTensor,
-    temperature: FloatTensor,
-    temperature_min: FloatTensor,
-    temperature_max: FloatTensor,
+    x_low: Array,
+    x_high: Array,
+    temperature: Array,
+    temperature_min: Array,
+    temperature_max: Array,
     mode: str,
-) -> FloatTensor:
+) -> Array:
     """Interpolate the temperature axis with the table's own interpolation mode.
 
     Parameters
@@ -183,7 +191,7 @@ def interp_temperature(
 
     Returns
     -------
-    :obj:`torch.Tensor`
+    :obj:`jax.Array`
         Interpolated values
 
     """
@@ -227,9 +235,9 @@ class OpacityInterpolator:
 
     def __init__(
         self,
-        table: FloatTensor,
-        temperature_grid: FloatTensor,
-        pressure_grid: FloatTensor,
+        table: Array,
+        temperature_grid: Array,
+        pressure_grid: Array,
         mode: str,
     ) -> None:
         """Initialise the interpolator.
@@ -251,12 +259,10 @@ class OpacityInterpolator:
         """
         self.table = table
         self.temperature_grid = temperature_grid
-        self.log_pressure_grid = torch.log10(pressure_grid)
+        self.log_pressure_grid = jnp.log10(pressure_grid)
         self.mode = mode
 
-    def __call__(
-        self, temperature: FloatTensor, log_pressure: FloatTensor
-    ) -> FloatTensor:
+    def __call__(self, temperature: Array, log_pressure: Array) -> Array:
         """Interpolate to ``temperature`` and ``log_pressure`` per layer.
 
         Parameters
@@ -270,7 +276,7 @@ class OpacityInterpolator:
 
         Returns
         -------
-        :obj:`torch.Tensor`
+        :obj:`jax.Array`
             Cross-sections in m^2, shape ``(nlayers, nwn)``
 
         """
@@ -308,7 +314,7 @@ class OpacityInterpolator:
         # Past the edge of the grid one axis is pinned to the last or first
         # entry and the other keeps its dependence, exactly as
         # interp_temp_only / interp_pressure_only do.
-        def temperature_branch(pressure_index: int) -> FloatTensor:
+        def temperature_branch(pressure_index: int) -> Array:
             return interp_temperature(
                 self.table[pressure_index, t_low],
                 self.table[pressure_index, t_high],
@@ -318,7 +324,7 @@ class OpacityInterpolator:
                 self.mode,
             )
 
-        def pressure_branch(temperature_index: int) -> FloatTensor:
+        def pressure_branch(temperature_index: int) -> Array:
             return physics.interp_lin(
                 self.table[p_low, temperature_index],
                 self.table[p_high, temperature_index],
@@ -332,21 +338,21 @@ class OpacityInterpolator:
         under_pressure_value = temperature_branch(0)
         under_temperature_value = pressure_branch(0)
 
-        def mask(flag: FloatTensor) -> FloatTensor:
+        def mask(flag: Array) -> Array:
             return flag[:, None]
 
-        result = torch.where(
+        result = jnp.where(
             mask(over_pressure & over_temperature), self.table[-1, -1], bilinear
         )
-        result = torch.where(
+        result = jnp.where(
             mask(under_pressure & under_temperature),
-            torch.zeros_like(bilinear),
+            jnp.zeros_like(bilinear),
             result,
         )
-        result = torch.where(mask(over_pressure), over_pressure_value, result)
-        result = torch.where(mask(over_temperature), over_temperature_value, result)
-        result = torch.where(mask(under_pressure), under_pressure_value, result)
-        result = torch.where(mask(under_temperature), under_temperature_value, result)
+        result = jnp.where(mask(over_pressure), over_pressure_value, result)
+        result = jnp.where(mask(over_temperature), over_temperature_value, result)
+        result = jnp.where(mask(under_pressure), under_pressure_value, result)
+        result = jnp.where(mask(under_temperature), under_temperature_value, result)
         return result / 10000.0
 
 
@@ -374,10 +380,10 @@ class ThermalState:
 
     def __init__(
         self,
-        temperature: FloatTensor,
-        pressure: FloatTensor,
-        density: FloatTensor,
-        mix: t.Dict[str, FloatTensor],
+        temperature: Array,
+        pressure: Array,
+        density: Array,
+        mix: t.Dict[str, Array],
         n_wavenumbers: int,
     ) -> None:
         """Initialise the layer state.
@@ -402,7 +408,7 @@ class ThermalState:
         """
         self.temperature = temperature
         self.pressure = pressure
-        self.log_pressure = torch.log10(pressure)
+        self.log_pressure = jnp.log10(pressure)
         self.density = density
         self.mix = mix
         self.n_wavenumbers = n_wavenumbers
@@ -416,9 +422,9 @@ class ContributionPlan:
 
     def sigma(
         self,
-        values: t.Dict[str, FloatTensor],
+        values: t.Dict[str, Array],
         thermal: ThermalState,
-    ) -> t.Optional[FloatTensor]:
+    ) -> t.Optional[Array]:
         """Cross-section of this contribution, before the density weighting.
 
         Parameters
@@ -431,7 +437,7 @@ class ContributionPlan:
 
         Returns
         -------
-        :obj:`torch.Tensor` or None
+        :obj:`jax.Array` or None
             Cross-sections in m^2, shape ``(nlayers, nwn)``, or None when the
             contribution is inactive
 
@@ -470,7 +476,7 @@ class RayleighPlan(ContributionPlan):
 
     name = "Rayleigh"
 
-    def __init__(self, terms: t.List[t.Tuple[str, FloatTensor]]) -> None:
+    def __init__(self, terms: t.List[t.Tuple[str, Array]]) -> None:
         """Initialise the plan.
 
         Parameters
@@ -496,9 +502,7 @@ class CiaPlan(ContributionPlan):
     name = "CIA"
     density_power = 2
 
-    def __init__(
-        self, terms: t.List[t.Tuple[str, str, FloatTensor, FloatTensor]]
-    ) -> None:
+    def __init__(self, terms: t.List[t.Tuple[str, str, Array, Array]]) -> None:
         """Initialise the plan.
 
         Parameters
@@ -525,8 +529,8 @@ class CiaPlan(ContributionPlan):
             # the temperature grid instead of extrapolating.
             over = (thermal.temperature > temperature_grid[-1])[:, None]
             under = (thermal.temperature < temperature_grid[0])[:, None]
-            sigma_cia = torch.where(over, table[-1], sigma_cia)
-            sigma_cia = torch.where(under, table[0], sigma_cia)
+            sigma_cia = jnp.where(over, table[-1], sigma_cia)
+            sigma_cia = jnp.where(under, table[0], sigma_cia)
 
             factor = (thermal.mix[pair_one] * thermal.mix[pair_two])[:, None]
             term = sigma_cia * factor
@@ -568,55 +572,61 @@ class FlatMiePlan(ContributionPlan):
 
         """
         self._atmosphere = atmosphere
-        # Flipped once here: flipping in the forward pass would hand torch a
-        # negative-stride view, which it refuses to convert.
-        self._log_levels = np.log10(
-            np.asarray(pressure_levels, dtype=get_float_dtype())
-        )[::-1].copy()
+        # Built once here: the numpy code flips this grid inside the forward
+        # pass, which a traced function cannot do to a closed over array.
+        self._log_levels = jnp.asarray(
+            np.log10(np.asarray(pressure_levels, dtype=get_float_dtype()))[::-1],
+            dtype=atmosphere.dtype,
+        )
 
     def sigma(self, values, thermal):
         """Cross-section of the cloud deck."""
         read = self._atmosphere._value
         # A negative boundary means "not set", in which case the deck reaches
         # the surface or the top of the atmosphere.
-        top = self._boundary(values, "flat_topP", self._log_levels.min())
-        bottom = self._boundary(values, "flat_bottomP", self._log_levels.max())
-        low = torch.minimum(top, bottom)
-        high = torch.maximum(top, bottom)
+        top = self._boundary(values, "flat_topP", self._fallback_surface())
+        bottom = self._boundary(values, "flat_bottomP", self._fallback_top())
+        low = jnp.minimum(top, bottom)
+        high = jnp.maximum(top, bottom)
 
         p_left = self._log_levels[:-1]
         p_right = self._log_levels[1:]
 
-        save_start = int(np.searchsorted(p_right, float(low.detach()), side="right"))
-        save_stop = int(
-            np.searchsorted(p_left[1:], float(high.detach()), side="right")
-        )
+        # The layer window is fixed by searchsorted on the static pressure grid,
+        # but the bounds stay traced and the window is selected with a mask.
+        # That is what keeps the whole plan traceable: a python slice would need
+        # the layer indices as concrete integers and would re-trace the model
+        # whenever the cloud deck moved by one layer.
+        layers = jnp.arange(p_left.shape[0])
+        save_start = jnp.searchsorted(p_right, low, side="right")
+        save_stop = jnp.searchsorted(p_left[1:], high, side="right")
+        selected = (layers >= save_start) & (layers <= save_stop)
 
-        left = physics.as_tensor(
-            p_left[save_start : save_stop + 1],
-            dtype=thermal.temperature.dtype,
-            device=thermal.temperature.device,
-        )
-        right = physics.as_tensor(
-            p_right[save_start : save_stop + 1],
-            dtype=thermal.temperature.dtype,
-            device=thermal.temperature.device,
-        )
-        window = torch.clamp(right, max=high) - torch.clamp(left, min=low)
-        window = window / window.max()
+        window = jnp.minimum(p_right, high) - jnp.maximum(p_left, low)
+        window = jnp.where(selected, window, 0.0)
+        # A deck that spans no layer at all leaves nothing to normalise by.
+        # The numpy implementation raises there; a traced program cannot branch
+        # on the value, so an empty window stays an empty window instead of
+        # producing a NaN that would poison the gradient.
+        largest = jnp.max(window)
+        window = window / jnp.where(largest == 0.0, jnp.ones_like(largest), largest)
 
-        sigma = torch.zeros(
-            thermal.temperature.shape[0],
-            thermal.n_wavenumbers,
-            dtype=thermal.temperature.dtype,
-            device=thermal.temperature.device,
+        sigma = jnp.where(
+            selected[:, None],
+            window[:, None] * read(values, "flat_mix_ratio"),
+            jnp.zeros_like(window[:, None]),
         )
-        sigma[save_start : save_stop + 1] = (
-            window[:, None] * read(values, "flat_mix_ratio")
-        )
-        return sigma.flip(0)
+        return sigma[::-1]
 
-    def _boundary(self, values, name: str, fallback: float) -> FloatTensor:
+    def _fallback_surface(self) -> Array:
+        """Log10 pressure of the bottom of the atmosphere."""
+        return jnp.min(self._log_levels)
+
+    def _fallback_top(self) -> Array:
+        """Log10 pressure of the top of the atmosphere."""
+        return jnp.max(self._log_levels)
+
+    def _boundary(self, values, name: str, fallback: Array) -> Array:
         """Log10 pressure of a cloud deck boundary.
 
         Parameters
@@ -632,18 +642,14 @@ class FlatMiePlan(ContributionPlan):
 
         Returns
         -------
-        :obj:`torch.Tensor`
+        :obj:`jax.Array`
             Log10 boundary pressure
 
         """
         current = self._atmosphere._all_params[name][2]()
         if current is None or current < 0:
-            return physics.as_tensor(
-                fallback,
-                dtype=self._atmosphere.dtype,
-                device=self._atmosphere.device,
-            )
-        return torch.log10(self._atmosphere._value(values, name))
+            return fallback
+        return jnp.log10(self._atmosphere._value(values, name))
 
 
 class Atmosphere:
@@ -654,8 +660,7 @@ class Atmosphere:
         model,
         observed=None,
         fit_params: t.Optional[t.Sequence[t.Any]] = None,
-        device: t.Optional[t.Union[str, torch.device]] = None,
-        dtype: torch.dtype = torch.float64,
+        dtype: jnp.dtype = jnp.float64,
     ) -> None:
         """Initialise the differentiable atmosphere.
 
@@ -675,14 +680,12 @@ class Atmosphere:
             every parameter flagged ``to_fit`` in the model and observation is
             used.
 
-        device:
-            Torch device to run on
-
         dtype:
-            Floating point dtype to use
+            Floating point dtype to use. The package enables JAX's 64 bit mode
+            on import, so this is ``float64`` by default and matches the numpy
+            model.
 
         """
-        self.device = torch.device(device or "cpu")
         self.dtype = dtype
 
         self.model = model
@@ -724,11 +727,9 @@ class Atmosphere:
             for param in fit_params:
                 self._priors[param.name] = param.fit_prior
 
-    def _frozen(self, name: str) -> FloatTensor:
+    def _frozen(self, name: str) -> Array:
         """Current value of a parameter that is not being fitted."""
-        return physics.as_tensor(
-            self._all_params[name][2](), dtype=self.dtype, device=self.device
-        )
+        return physics.as_array(self._all_params[name][2](), dtype=self.dtype)
 
     def _prior(self, name: str):
         """Prior object of a fitted parameter."""
@@ -742,7 +743,7 @@ class Atmosphere:
             return LogUniform(lin_bounds=bounds)
         return Uniform(bounds=bounds)
 
-    def _parameters(self, theta: FloatTensor) -> t.Dict[str, FloatTensor]:
+    def _parameters(self, theta: Array) -> t.Dict[str, Array]:
         """Map the fitted vector onto named physical parameters.
 
         Parameters
@@ -753,11 +754,11 @@ class Atmosphere:
 
         Returns
         -------
-        :obj:`dict` of str to :obj:`torch.Tensor`
+        :obj:`dict` of str to :obj:`jax.Array`
             Physical parameter values
 
         """
-        values: t.Dict[str, FloatTensor] = {}
+        values: t.Dict[str, Array] = {}
         for name, index in self._index.items():
             raw = theta[index]
             prior = self._prior(name)
@@ -765,17 +766,15 @@ class Atmosphere:
             values[name] = 10**raw if mode is PriorMode.LOG else raw
         return values
 
-    def _value(
-        self, values: t.Dict[str, FloatTensor], name: str
-    ) -> FloatTensor:
+    def _value(self, values: t.Dict[str, Array], name: str) -> Array:
         """Value of a parameter, fitted or frozen."""
         if name in values:
             return values[name]
         return self._frozen(name)
 
     def _node_pressure(
-        self, values: t.Dict[str, FloatTensor], name: str, fallback: float
-    ) -> FloatTensor:
+        self, values: t.Dict[str, Array], name: str, fallback: float
+    ) -> Array:
         """Pressure of a temperature profile node.
 
         The node pressures are optional: when the input file leaves them out
@@ -796,7 +795,7 @@ class Atmosphere:
 
         Returns
         -------
-        :obj:`torch.Tensor`
+        :obj:`jax.Array`
             Node pressure in Pa
 
         """
@@ -804,7 +803,7 @@ class Atmosphere:
             current = self._all_params[name][2]()
             if current is not None and current >= 0:
                 return self._value(values, name)
-        return physics.as_tensor(fallback, dtype=self.dtype, device=self.device)
+        return physics.as_array(fallback, dtype=self.dtype)
 
     def _build_geometry(self) -> None:
         """Cache the pressure grid, planet constants and the working grid."""
@@ -818,13 +817,10 @@ class Atmosphere:
             pressure.pressure_profile_levels, dtype=get_float_dtype()
         )
         self._n_layers = model.nLayers
-        self._p_levels = physics.as_tensor(
-            self._pressure_levels, dtype=self.dtype, device=self.device
-        )
-        self._p_centres = physics.as_tensor(
+        self._p_levels = physics.as_array(self._pressure_levels, dtype=self.dtype)
+        self._p_centres = physics.as_array(
             np.asarray(pressure.pressure_profile, dtype=get_float_dtype()),
             dtype=self.dtype,
-            device=self.device,
         )
 
         self._r_jup = RJUP
@@ -848,6 +844,7 @@ class Atmosphere:
             self._binning_matrix = None
             self._data = None
             self._error = None
+            self._log_normalisation = 0.0
             return
 
         from taurex.binning import FluxBinner
@@ -863,18 +860,25 @@ class Atmosphere:
             )
         self.binning = binner
 
-        self._data = physics.as_tensor(
-            self.observed.spectrum.ravel(), dtype=self.dtype, device=self.device
+        self._data = physics.as_array(
+            self.observed.spectrum.ravel(), dtype=self.dtype
         )
-        self._error = physics.as_tensor(
-            self.observed.errorBar.ravel(), dtype=self.dtype, device=self.device
+        self._error = physics.as_array(
+            self.observed.errorBar.ravel(), dtype=self.dtype
+        )
+        # Fixed for the lifetime of the object, so the normalisation of the
+        # likelihood is folded into a python float here instead of being
+        # recomputed inside every traced evaluation.
+        error = np.asarray(self.observed.errorBar.ravel(), dtype=get_float_dtype())
+        self._log_normalisation = float(
+            np.sum(np.log(error)) + error.shape[0] * 0.5 * np.log(2.0 * np.pi)
         )
 
         if isinstance(binner, NativeBinner):
             self._binning_matrix = None
         else:
-            self._binning_matrix = physics.as_tensor(
-                self._overlap_matrix(binner), dtype=self.dtype, device=self.device
+            self._binning_matrix = physics.as_array(
+                self._overlap_matrix(binner), dtype=self.dtype
             )
 
     def _overlap_matrix(self, binner) -> np.ndarray:
@@ -922,11 +926,11 @@ class Atmosphere:
 
     def _resample_table(
         self,
-        table: FloatTensor,
+        table: Array,
         source: np.ndarray,
         hold: t.Optional[bool] = None,
         subset: t.Optional[np.ndarray] = None,
-    ) -> FloatTensor:
+    ) -> Array:
         """Resample a table onto the working wavenumber grid.
 
         Parameters
@@ -945,7 +949,7 @@ class Atmosphere:
 
         Returns
         -------
-        :obj:`torch.Tensor`
+        :obj:`jax.Array`
             Table resampled onto :attr:`wngrid`
 
         """
@@ -954,7 +958,6 @@ class Atmosphere:
             self.wngrid,
             hold=self._hold if hold is None else hold,
             dtype=self.dtype,
-            device=self.device,
             subset=subset,
         )
         if subset is None:
@@ -985,22 +988,19 @@ class Atmosphere:
             subset = np.where(
                 (source >= self.wngrid.min()) & (source <= self.wngrid.max())
             )[0]
-            table = physics.as_tensor(
+            table = physics.as_array(
                 np.asarray(opacity.xsecGrid, dtype=get_float_dtype()),
                 dtype=self.dtype,
-                device=self.device,
             )
             self._interpolators[gas] = OpacityInterpolator(
                 self._resample_table(table, source, subset=subset),
-                physics.as_tensor(
+                physics.as_array(
                     np.asarray(opacity.temperatureGrid, dtype=get_float_dtype()),
                     dtype=self.dtype,
-                    device=self.device,
                 ),
-                physics.as_tensor(
+                physics.as_array(
                     np.asarray(opacity.pressureGrid, dtype=get_float_dtype()),
                     dtype=self.dtype,
-                    device=self.device,
                 ),
                 opacity._interp_mode,
             )
@@ -1047,9 +1047,7 @@ class Atmosphere:
             sigma = rayleigh_sigma_from_name(gas, self.wngrid)
             if sigma is None:
                 continue
-            terms.append(
-                (gas, physics.as_tensor(sigma, dtype=self.dtype, device=self.device))
-            )
+            terms.append((gas, physics.as_array(sigma, dtype=self.dtype)))
         return RayleighPlan(terms)
 
     def _cia_plan(self, contribution: CIAContribution) -> CiaPlan:
@@ -1061,19 +1059,17 @@ class Atmosphere:
         for pair_name in contribution.ciaPairs:
             cia = cache[pair_name]
             source = np.asarray(cia.wavenumberGrid, dtype=get_float_dtype())
-            table = physics.as_tensor(
+            table = physics.as_array(
                 np.asarray(cia._xsec_grid, dtype=get_float_dtype()),
                 dtype=self.dtype,
-                device=self.device,
             )
             terms.append(
                 (
                     cia.pairOne,
                     cia.pairTwo,
-                    physics.as_tensor(
+                    physics.as_array(
                         np.asarray(cia.temperatureGrid, dtype=get_float_dtype()),
                         dtype=self.dtype,
-                        device=self.device,
                     ),
                     # CIA.cia() applies np.interp, which clamps at the edges.
                     self._resample_table(table, source, hold=True),
@@ -1084,15 +1080,15 @@ class Atmosphere:
     # ------------------------------------------------------------------
     # Physics
     # ------------------------------------------------------------------
-    def _temperature(self, values) -> FloatTensor:
+    def _temperature(self, values) -> Array:
         """Temperature at each layer centre in K."""
         from taurex.data.profiles.temperature import Isothermal
         from taurex.data.profiles.temperature import NPoint
 
         profile = self.model.temperature
         if isinstance(profile, Isothermal):
-            return self._value(values, "T") * torch.ones(
-                self._n_layers, dtype=self.dtype, device=self.device
+            return self._value(values, "T") * jnp.ones(
+                self._n_layers, dtype=self.dtype
             )
 
         if isinstance(profile, NPoint):
@@ -1101,7 +1097,7 @@ class Atmosphere:
             )
             top = self._node_pressure(values, "P_top", profile.pressure_profile[-1])
             n_points = profile._p_points.shape[0]
-            pressure_nodes = torch.stack(
+            pressure_nodes = jnp.stack(
                 [
                     surface,
                     *[
@@ -1111,7 +1107,7 @@ class Atmosphere:
                     top,
                 ]
             )
-            temperature_nodes = torch.stack(
+            temperature_nodes = jnp.stack(
                 [
                     self._value(values, "T_surface"),
                     *[
@@ -1133,7 +1129,7 @@ class Atmosphere:
             f"temperature profiles, got {type(profile).__name__}"
         )
 
-    def _chemistry(self, values) -> t.Tuple[t.Dict[str, FloatTensor], FloatTensor]:
+    def _chemistry(self, values) -> t.Tuple[t.Dict[str, Array], Array]:
         """Mixing ratio profiles and mean molecular weight per layer.
 
         Parameters
@@ -1163,10 +1159,10 @@ class Atmosphere:
                     f"profiles, got {type(gas).__name__} for {gas.molecule}"
                 )
 
-        ones = torch.ones(self._n_layers, dtype=self.dtype, device=self.device)
+        ones = jnp.ones(self._n_layers, dtype=self.dtype)
 
-        mix: t.Dict[str, FloatTensor] = {}
-        total = torch.zeros(self._n_layers, dtype=self.dtype, device=self.device)
+        mix: t.Dict[str, Array] = {}
+        total = jnp.zeros(self._n_layers, dtype=self.dtype)
         for gas in chemistry._gases:
             profile = self._value(values, gas.molecule) * ones
             mix[gas.molecule] = profile
@@ -1184,43 +1180,31 @@ class Atmosphere:
             for gas, ratio in zip(fill_gases[1:], ratios, strict=True):
                 mix[gas] = ratio * main_share
 
-        mu = torch.zeros(self._n_layers, dtype=self.dtype, device=self.device)
+        mu = jnp.zeros(self._n_layers, dtype=self.dtype)
         for gas, profile in mix.items():
-            mass = physics.as_tensor(
-                chemistry.get_molecular_mass(gas), dtype=self.dtype, device=self.device
-            )
+            mass = physics.as_array(chemistry.get_molecular_mass(gas), dtype=self.dtype)
             mu = mu + mass * profile
 
         return mix, mu
 
-    def _planet(self, values) -> t.Tuple[FloatTensor, FloatTensor]:
+    def _planet(self, values) -> t.Tuple[Array, Array]:
         """Planet radius and mass in SI units."""
         planet = self.model.planet
         if self._has("planet_radius"):
             radius = self._value(values, "planet_radius") * self._r_jup
         else:
-            radius = physics.as_tensor(
-                planet.get_planet_radius(unit="m"),
-                dtype=self.dtype,
-                device=self.device,
-            )
+            radius = physics.as_array(planet.get_planet_radius(unit="m"), dtype=self.dtype)
         if self._has("planet_mass"):
             mass = self._value(values, "planet_mass") * self._m_jup
         else:
-            mass = physics.as_tensor(
-                planet.get_planet_mass(unit="kg"),
-                dtype=self.dtype,
-                device=self.device,
-            )
+            mass = physics.as_array(planet.get_planet_mass(unit="kg"), dtype=self.dtype)
         return radius, mass
 
     def _has(self, name: str) -> bool:
         """Whether a fitting parameter exists on the model or observation."""
         return name in self._all_params
 
-    def forward(
-        self, theta: FloatTensor
-    ) -> t.Tuple[FloatTensor, FloatTensor, FloatTensor]:
+    def forward(self, theta: Array) -> t.Tuple[Array, Array, Array]:
         """Run the atmosphere and return everything needed downstream.
 
         Parameters
@@ -1260,10 +1244,10 @@ class Atmosphere:
             n_wavenumbers=self._n_wavenumbers,
         )
 
-        weighted_sigma = torch.zeros(
-            self._n_layers, self._n_wavenumbers, dtype=self.dtype, device=self.device
+        weighted_sigma = jnp.zeros(
+            (self._n_layers, self._n_wavenumbers), dtype=self.dtype
         )
-        weight_cache: t.Dict[int, t.Optional[FloatTensor]] = {}
+        weight_cache: t.Dict[int, t.Optional[Array]] = {}
         for plan in self._plans:
             sigma = plan.sigma(values, thermal)
             if sigma is None:
@@ -1279,16 +1263,16 @@ class Atmosphere:
             weighted_sigma = weighted_sigma + sigma
 
         tau = path @ weighted_sigma
-        transmission = torch.exp(-tau)
+        transmission = jnp.exp(-tau)
 
         # TransmissionModel.compute_absorption overwrites tau with exp(-tau)
         # and then integrates (1 - tau), so the darkening is 1 - transmission.
-        integral = torch.sum(
+        integral = jnp.sum(
             (planet_radius + altitude[:-1])[:, None]
             * (1.0 - transmission)
             * deltaz[:, None]
             * 2.0,
-            dim=0,
+            axis=0,
         )
         depth = (planet_radius**2 + integral) / self._star_radius**2
         return depth, tau, temperature
@@ -1300,7 +1284,7 @@ class Atmosphere:
 
         return KBOLTZ
 
-    def native_spectrum(self, theta: FloatTensor) -> t.Tuple[FloatTensor, FloatTensor]:
+    def native_spectrum(self, theta: Array) -> t.Tuple[np.ndarray, Array]:
         """Unbinned transmission spectrum.
 
         Parameters
@@ -1317,7 +1301,7 @@ class Atmosphere:
         depth, _, _ = self.forward(theta)
         return self.wngrid, depth
 
-    def spectrum(self, theta: FloatTensor) -> FloatTensor:
+    def spectrum(self, theta: Array) -> Array:
         """Binned model spectrum for a set of fitted parameters.
 
         Parameters
@@ -1327,7 +1311,7 @@ class Atmosphere:
 
         Returns
         -------
-        :obj:`torch.Tensor`
+        :obj:`jax.Array`
             Model flux on the observation grid
 
         """
@@ -1336,7 +1320,7 @@ class Atmosphere:
             return depth
         return self._binning_matrix @ depth
 
-    def chi_squared(self, theta: FloatTensor) -> FloatTensor:
+    def chi_squared(self, theta: Array) -> Array:
         """Chi-squared against the observation.
 
         Parameters
@@ -1346,14 +1330,14 @@ class Atmosphere:
 
         Returns
         -------
-        :obj:`torch.Tensor`
+        :obj:`jax.Array`
             Scalar chi-squared
 
         """
         residual = (self._data - self.spectrum(theta)) / self._error
-        return torch.sum(residual * residual)
+        return jnp.sum(residual * residual)
 
-    def log_likelihood(self, theta: FloatTensor) -> FloatTensor:
+    def log_likelihood(self, theta: Array) -> Array:
         """Log likelihood, matching the convention of the taurex optimizers.
 
         Parameters
@@ -1363,11 +1347,8 @@ class Atmosphere:
 
         Returns
         -------
-        :obj:`torch.Tensor`
+        :obj:`jax.Array`
             Scalar log likelihood
 
         """
-        normalisation = torch.sum(torch.log(self._error)) + self._error.shape[0] * 0.5 * float(
-            np.log(2.0 * np.pi)
-        )
-        return -normalisation - 0.5 * self.chi_squared(theta)
+        return -self._log_normalisation - 0.5 * self.chi_squared(theta)

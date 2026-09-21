@@ -12,7 +12,8 @@ import pytest
 from taurex.differentiability import Atmosphere, LaplaceOptimizer
 
 
-torch = pytest.importorskip("torch")
+jax = pytest.importorskip("jax")
+jnp = jax.numpy
 
 
 NAMES = ("planet_radius", "T", "H2O")
@@ -38,10 +39,9 @@ def make_data(optimizer, taurex_model, observation, truth, noise=0.0, seed=1):
     atmosphere = Atmosphere(
         taurex_model, observation, fit_params=optimizer.fitting_parameters
     )
-    with torch.no_grad():
-        model = atmosphere.spectrum(torch.tensor(truth, dtype=torch.float64))
+    model = atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64))
 
-    data = model.numpy().copy()
+    data = np.asarray(model).copy()
     if noise:
         generator = np.random.default_rng(seed)
         data = data + generator.normal(0.0, noise, data.shape)
@@ -76,12 +76,12 @@ def test_map_recovers_injected_parameters(optimizer, taurex_model, observation):
     optimizer.compute_fit()
 
     np.testing.assert_allclose(optimizer._map, TRUTH, rtol=0.0, atol=1e-4)
-    assert float(optimizer.atmosphere.chi_squared(
-        torch.tensor(optimizer._map, dtype=torch.float64)
-    )) < 1e-6
+    assert float(
+        optimizer.atmosphere.chi_squared(jnp.asarray(optimizer._map, dtype=jnp.float64))
+    ) < 1e-6
 
 
-def test_noiseless_map_is_the_minimum(optimizer, taurex_model, observation):
+def test_map_is_the_minimum(optimizer, taurex_model, observation):
     """Chi-squared does not decrease when the fit is restarted from the MAP."""
     make_data(optimizer, taurex_model, observation, TRUTH)
     optimizer.compute_fit()
@@ -91,15 +91,13 @@ def test_noiseless_map_is_the_minimum(optimizer, taurex_model, observation):
     optimizer.compute_fit()
     perturbed = float(
         optimizer.atmosphere.chi_squared(
-            torch.tensor(optimizer._map, dtype=torch.float64)
+            jnp.asarray(optimizer._map, dtype=jnp.float64)
         )
     )
 
     optimizer.update_model(TRUTH)
     best = float(
-        optimizer.atmosphere.chi_squared(
-            torch.tensor(TRUTH, dtype=torch.float64)
-        )
+        optimizer.atmosphere.chi_squared(jnp.asarray(TRUTH, dtype=jnp.float64))
     )
     assert perturbed < best + 1e-6
 
@@ -152,6 +150,22 @@ def test_solution_exposes_map_and_median(optimizer, taurex_model, observation):
     assert extra == []
     np.testing.assert_allclose(map_values, optimizer._map)
     np.testing.assert_allclose(median_values, np.median(optimizer.get_samples(0), axis=0))
+
+
+def test_reported_timings_and_counts(optimizer, taurex_model, observation):
+    """The fit reports what it cost, so the two backends can be compared."""
+    make_data(optimizer, taurex_model, observation, TRUTH)
+    # Start away from the optimum, otherwise the fit converges on its first
+    # gradient check and there is nothing to count.
+    optimizer.update_model(np.array([1.30, 850.0, -3.5]))
+    optimizer.compute_fit()
+
+    assert optimizer.iterations > 0
+    assert optimizer.function_evaluations > 0
+    assert optimizer.gradient_evaluations > 0
+    assert optimizer.compile_time > 0.0
+    assert optimizer.fit_time > 0.0
+    assert optimizer.laplace_time > 0.0
 
 
 def test_gaussian_prior_is_used(taurex_model, observation):
