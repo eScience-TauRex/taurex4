@@ -1,0 +1,159 @@
+"""Tests for the differentiable transmission forward model.
+
+The central claim is that the torch port reproduces the numpy model exactly, so
+a retrieval driven by its gradient is fitting the same likelihood. These tests
+check the spectrum, the optical depth and the log likelihood against the numpy
+model, and check that the gradient the optimizer follows is the derivative of
+that same quantity.
+"""
+
+import numpy as np
+import pytest
+
+from taurex.differentiability import Atmosphere
+
+from .conftest import compile_fit_params
+
+
+torch = pytest.importorskip("torch")
+
+
+def test_native_spectrum_matches_numpy_model(data_path, taurex_model, observation):
+    """The torch atmosphere reproduces the numpy transmission spectrum."""
+    atmosphere = Atmosphere(taurex_model, observation, fit_params=[])
+    theta = torch.zeros(0, dtype=torch.float64)
+
+    with torch.no_grad():
+        _, depth = atmosphere.native_spectrum(theta)
+    _, expected, _, _ = taurex_model.model(wngrid=observation.wavenumberGrid)
+
+    np.testing.assert_allclose(depth.numpy(), expected, rtol=1e-10, atol=0.0)
+
+
+def test_transmission_matches_numpy_path_integral(data_path, taurex_model, observation):
+    """Optical depth matches the numpy path integral to machine precision."""
+    atmosphere = Atmosphere(taurex_model, observation, fit_params=[])
+    theta = torch.zeros(0, dtype=torch.float64)
+
+    with torch.no_grad():
+        _, tau, _ = atmosphere.forward(theta)
+    _, transmission = taurex_model.path_integral(atmosphere.wngrid)
+
+    np.testing.assert_allclose(
+        torch.exp(-tau).numpy(), transmission, rtol=1e-10, atol=1e-14
+    )
+
+
+def test_binned_spectrum_matches_flux_binner(data_path, taurex_model, observation):
+    """The precomputed binning matrix reproduces the taurex binner."""
+    atmosphere = Atmosphere(taurex_model, observation, fit_params=[])
+    theta = torch.zeros(0, dtype=torch.float64)
+
+    with torch.no_grad():
+        binned = atmosphere.spectrum(theta)
+
+    output = taurex_model.model(wngrid=observation.wavenumberGrid)
+    expected = observation.create_binner().bin_model(output)[1]
+
+    np.testing.assert_allclose(binned.numpy(), np.ravel(expected), rtol=1e-10)
+
+
+def test_log_likelihood_matches_numpy_optimizer(data_path, taurex_model, observation):
+    """The torch log likelihood equals the one the numpy optimizer computes."""
+    from taurex.differentiability import LaplaceOptimizer
+
+    names = ("planet_radius", "T", "H2O")
+
+    optimizer = LaplaceOptimizer()
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    for name in names:
+        optimizer.enable_fit(name)
+
+    theta_values = np.array([1.30, 800.0, -4.0])
+    optimizer.update_model(theta_values)
+    expected = optimizer.log_likelihood(theta_values)
+
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    with torch.no_grad():
+        value = float(
+            atmosphere.log_likelihood(torch.tensor(theta_values, dtype=torch.float64))
+        )
+
+    assert value == pytest.approx(expected, rel=1e-10)
+
+
+def test_gradient_matches_finite_difference(data_path, taurex_model, observation):
+    """Autograd of the chi-squared agrees with central differences."""
+    names = ("planet_radius", "T", "H2O")
+    fit_params = compile_fit_params(taurex_model, observation, names)
+    atmosphere = Atmosphere(taurex_model, observation, fit_params=fit_params)
+
+    start = np.array([1.30, 800.0, -4.0])
+    point = torch.tensor(start, dtype=torch.float64, requires_grad=True)
+    atmosphere.chi_squared(point).backward()
+    analytic = point.grad.detach().numpy().copy()
+
+    steps = np.array([1e-5, 1e-2, 1e-5])
+    numeric = np.zeros_like(analytic)
+    with torch.no_grad():
+        for index in range(start.shape[0]):
+            offset = np.zeros_like(start)
+            offset[index] = steps[index]
+            plus = torch.tensor(start + offset, dtype=torch.float64)
+            minus = torch.tensor(start - offset, dtype=torch.float64)
+            numeric[index] = (
+                atmosphere.chi_squared(plus) - atmosphere.chi_squared(minus)
+            ) / (2.0 * steps[index])
+
+    assert np.all(np.abs(analytic) > 0.0)
+    np.testing.assert_allclose(analytic, numeric, rtol=1e-6)
+
+
+def test_native_grid_is_clipped_to_the_observation(data_path, taurex_model, observation):
+    """Only the part of the native grid the observation covers is modelled."""
+    from taurex.util import clip_native_to_wngrid
+
+    atmosphere = Atmosphere(taurex_model, observation, fit_params=[])
+    expected = clip_native_to_wngrid(
+        taurex_model.nativeWavenumberGrid, observation.wavenumberGrid
+    )
+
+    np.testing.assert_array_equal(atmosphere.wngrid, expected)
+    assert atmosphere.wngrid.size < taurex_model.nativeWavenumberGrid.size
+
+
+def test_chi_squared_is_zero_for_a_perfect_fit(data_path, taurex_model, observation):
+    """Data generated by the model has a vanishing chi-squared."""
+    atmosphere = Atmosphere(taurex_model, observation, fit_params=[])
+    theta = torch.zeros(0, dtype=torch.float64)
+
+    with torch.no_grad():
+        atmosphere._data = atmosphere.spectrum(theta).clone()
+        value = atmosphere.chi_squared(theta)
+
+    assert float(value) < 1e-20
+
+
+def test_unsupported_contribution_is_rejected(data_path, taurex_model, observation):
+    """A contribution without a differentiable plan fails loudly."""
+    from taurex.contributions import LeeMieContribution
+
+    taurex_model.add_contribution(LeeMieContribution())
+    with pytest.raises(NotImplementedError, match="LeeMie"):
+        Atmosphere(taurex_model, observation, fit_params=[])
+
+
+def test_unsupported_temperature_profile_is_rejected(
+    data_path, taurex_model, observation
+):
+    """A temperature profile without a differentiable plan fails loudly."""
+    from taurex.data.profiles.temperature import Guillot2010
+
+    taurex_model._temperature_profile = Guillot2010()
+    atmosphere = Atmosphere(taurex_model, observation, fit_params=[])
+    with pytest.raises(NotImplementedError, match="Guillot2010"):
+        with torch.no_grad():
+            atmosphere.native_spectrum(torch.zeros(0, dtype=torch.float64))
