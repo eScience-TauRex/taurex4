@@ -686,7 +686,7 @@ class Optimizer(Logger, Citable):
 
         # Release freed memory back to OS after sampling completes.
         # numpy's allocator holds onto pages, causing RSS to grow over time.
-        from taurex.util.memory import trim_memory
+        from taurex.util import trim_memory
 
         trim_memory()
 
@@ -1004,7 +1004,7 @@ class Optimizer(Logger, Citable):
 
         self.info("Computing derived parameters......")
         disableLogging()
-        from taurex.util.memory import trim_memory
+        from taurex.util import trim_memory
 
         for idx in range(rank, len_samples, num_procs):
             enableLogging()

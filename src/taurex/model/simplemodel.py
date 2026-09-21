@@ -676,8 +676,8 @@ class SimpleForwardModel(ForwardModel):
             spectrum
 
         """
+        from taurex.util import trim_memory
         from taurex.util.math import OnlineVariance
-        from taurex.util.memory import trim_memory
 
         tp_profiles = OnlineVariance()
         active_gases = OnlineVariance()

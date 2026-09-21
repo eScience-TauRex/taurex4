@@ -1,0 +1,184 @@
+Lmod Warning:
+-------------------------------------------------------------------------------
+The following dependent module(s) are not currently loaded: GCC/14.3.0
+(required by: OpenBLAS/0.3.30-GCC-14.3.0)
+-------------------------------------------------------------------------------
+
+
+
+
+The following have been reloaded with a version change:
+  1) GCC/14.3.0 => GCC/14.2.0
+  2) GCCcore/14.3.0 => GCCcore/14.2.0
+  3) binutils/2.44-GCCcore-14.3.0 => binutils/2.42-GCCcore-14.2.0
+  4) zlib/1.3.1-GCCcore-14.3.0 => zlib/1.3.1-GCCcore-14.2.0
+
+taurex - INFO - TauREx 3.3.3
+taurex - INFO - TauREx PROGRAM START AT 2026-09-21 11:00:56.444233
+taurex.ParamParser - INFO - Interpolation mode set to linear
+taurex.ParamParser - WARNING - Xsecs will be loaded in memory
+taurex.ParamParser - WARNING - Radis is disabled
+taurex.ParamParser - WARNING - Radis default grid will be used
+taurex.ClassFactory - INFO - Reloading all modules and plugins
+taurex.ClassFactory - INFO - ----------Plugin loading---------
+taurex.ClassFactory - INFO - Loading differentiability
+taurex.ClassFactory - INFO - Loading fastchem
+taurex.ClassFactory - INFO - Loading ggchem
+taurex.ClassFactory - INFO - Loading taurex-pcq
+taurex.TransmissionModel - INFO - Building model........
+taurex.TransmissionModel - INFO - Collecting paramters
+taurex.TransmissionModel - INFO - Setting up profiles
+taurex.TransmissionModel - INFO - Setting up contributions
+taurex.TransmissionModel - INFO - DONE
+taurex.TransmissionModel - INFO - Computing pressure profile
+taurex.ChemistryModel - INFO - Initializing chemistry model
+taurex.OpacityCache - INFO - Reading opacity H2O
+taurex.OpacityCache - INFO - Loading opacity H2O into model
+taurex.OpacityCache - INFO - Reading opacity CO2
+taurex.OpacityCache - INFO - Loading opacity CO2 into model
+taurex.Absorption - INFO - Using cross-sections? True
+taurex.Absorption - INFO - Recomputing active gas H2O opacity
+taurex.Absorption - INFO - Recomputing active gas CO2 opacity
+taurex.Absorption - INFO - Done
+taurex.Rayleigh - INFO - Done
+taurex.CIA - INFO - Computing CIA 
+taurex.PickleCIA - INFO - Loading cia cross section from ../Inputs/cia/H2-H2.db
+taurex.PickleCIA - INFO - Moving to shared memory
+taurex.PickleCIA - INFO - Shared-memory group: rank 0 / 1 (world rank 0)
+taurex.PickleCIA - WARNING - Shared-memory group has only 1 rank(s)! MPI shared memory is NOT reducing duplication — all ranks have private copies. Check that ranks are on the same NUMA node (socket) and that your MPI implementation supports COMM_TYPE_SHARED.
+taurex.PickleCIA - INFO - Moving to shared memory
+taurex.PickleCIA - INFO - Shared-memory group: rank 0 / 1 (world rank 0)
+taurex.PickleCIA - WARNING - Shared-memory group has only 1 rank(s)! MPI shared memory is NOT reducing duplication — all ranks have private copies. Check that ranks are on the same NUMA node (socket) and that your MPI implementation supports COMM_TYPE_SHARED.
+taurex.PickleCIA - INFO - Moving to shared memory
+taurex.PickleCIA - INFO - Shared-memory group: rank 0 / 1 (world rank 0)
+taurex.PickleCIA - WARNING - Shared-memory group has only 1 rank(s)! MPI shared memory is NOT reducing duplication — all ranks have private copies. Check that ranks are on the same NUMA node (socket) and that your MPI implementation supports COMM_TYPE_SHARED.
+taurex.CIACache - INFO - Loading cia H2-H2 into model
+taurex.PickleCIA - INFO - Loading cia cross section from ../Inputs/cia/H2-He.db
+taurex.PickleCIA - INFO - Moving to shared memory
+taurex.PickleCIA - INFO - Shared-memory group: rank 0 / 1 (world rank 0)
+taurex.PickleCIA - WARNING - Shared-memory group has only 1 rank(s)! MPI shared memory is NOT reducing duplication — all ranks have private copies. Check that ranks are on the same NUMA node (socket) and that your MPI implementation supports COMM_TYPE_SHARED.
+taurex.PickleCIA - INFO - Moving to shared memory
+taurex.PickleCIA - INFO - Shared-memory group: rank 0 / 1 (world rank 0)
+taurex.PickleCIA - WARNING - Shared-memory group has only 1 rank(s)! MPI shared memory is NOT reducing duplication — all ranks have private copies. Check that ranks are on the same NUMA node (socket) and that your MPI implementation supports COMM_TYPE_SHARED.
+taurex.PickleCIA - INFO - Moving to shared memory
+taurex.PickleCIA - INFO - Shared-memory group: rank 0 / 1 (world rank 0)
+taurex.PickleCIA - WARNING - Shared-memory group has only 1 rank(s)! MPI shared memory is NOT reducing duplication — all ranks have private copies. Check that ranks are on the same NUMA node (socket) and that your MPI implementation supports COMM_TYPE_SHARED.
+taurex.CIACache - INFO - Loading cia H2-He into model
+taurex.CIA - INFO - Done
+taurex.Mie - INFO - Done
+taurex.TransmissionModel - INFO - Computing pressure profile
+taurex.ChemistryModel - INFO - Initializing chemistry model
+taurex.Absorption - INFO - Using cross-sections? True
+taurex.Absorption - INFO - Recomputing active gas H2O opacity
+taurex.Absorption - INFO - Recomputing active gas CO2 opacity
+taurex.Absorption - INFO - Done
+taurex.Rayleigh - INFO - Done
+taurex.CIA - INFO - Computing CIA 
+taurex.CIA - INFO - Done
+taurex.Mie - INFO - Done
+taurex.Multinest - INFO - Initializing parameters
+taurex.Multinest - INFO - -------FITTING---------------
+taurex.Multinest - INFO - Fitting Parameters available:
+taurex.Multinest - INFO - -------DERIVED---------------
+taurex.Multinest - INFO - Derived Parameters available:
+taurex.Multinest - INFO - Initializing parameters
+taurex.Multinest - INFO - -------FITTING---------------
+taurex.Multinest - INFO - Fitting Parameters available:
+taurex.Multinest - INFO - -------DERIVED---------------
+taurex.Multinest - INFO - Derived Parameters available:
+taurex.Multinest - INFO - Directory multi_simple_pytorch does not exist, creating
+taurex.Multinest - INFO - Found directory multi_simple_pytorch
+taurex.Multinest - INFO - Initializing parameters
+taurex.Multinest - INFO - -------FITTING---------------
+taurex.Multinest - INFO - Fitting Parameters available:
+taurex.Multinest - INFO - planet_mass, Value: 0.12 Type: Uniform, Params: Bounds = [0.5,1.5]
+taurex.Multinest - INFO - planet_radius, Value: 0.82 Type: Uniform, Params: Bounds = [0.9,1.1]
+taurex.Multinest - INFO - planet_distance, Value: 0.9999999999999999 Type: Uniform, Params: Bounds = [1,2]
+taurex.Multinest - INFO - planet_sma, Value: 0.9999999999999999 Type: Uniform, Params: Bounds = [1,2]
+taurex.Multinest - INFO - distance, Value: 1 Type: Uniform, Params: Bounds = [1,22]
+taurex.Multinest - INFO - atm_min_pressure, Value: 0.01 Type: LogUniform, Params: Bounds = [-1.0,0.0]
+taurex.Multinest - INFO - atm_max_pressure, Value: 1000000.0 Type: LogUniform, Params: Bounds = [-1.0,0.0]
+taurex.Multinest - INFO - T, Value: 800.0 Type: Uniform, Params: Bounds = [300.0,2000.0]
+taurex.Multinest - INFO - H2O, Value: 1e-05 Type: LogUniform, Params: Bounds = [-12.0,-1.0]
+taurex.Multinest - INFO - CO2, Value: 1e-05 Type: LogUniform, Params: Bounds = [-12.0,-1.0]
+taurex.Multinest - INFO - He_H2, Value: 0.172 Type: LogUniform, Params: Bounds = [-12.0,-1.0]
+taurex.Multinest - INFO - flat_topP, Value: 100.0 Type: LogUniform, Params: Bounds = [-20.0,0.0]
+taurex.Multinest - INFO - flat_bottomP, Value: -1 Type: LogUniform, Params: Bounds = [-20.0,0.0]
+taurex.Multinest - INFO - flat_mix_ratio, Value: 1000.0 Type: LogUniform, Params: Bounds = [-20.0,0.0]
+taurex.Multinest - INFO - -------DERIVED---------------
+taurex.Multinest - INFO - Derived Parameters available:
+taurex.Multinest - INFO - logg, Value: 0.6457690886843539
+taurex.Multinest - INFO - avg_T, Value: 800.0
+taurex.Multinest - INFO - metallicity, Value: 0.02000021960009744
+taurex.Multinest - INFO - mu, Value: 2.3080208117634124
+taurex.Multinest - INFO - Initializing parameters
+taurex.Multinest - INFO - -------FITTING---------------
+taurex.Multinest - INFO - Fitting Parameters available:
+taurex.Multinest - INFO - planet_mass, Value: 0.12 Type: Uniform, Params: Bounds = [0.5,1.5]
+taurex.Multinest - INFO - planet_radius, Value: 0.82 Type: Uniform, Params: Bounds = [0.9,1.1]
+taurex.Multinest - INFO - planet_distance, Value: 0.9999999999999999 Type: Uniform, Params: Bounds = [1,2]
+taurex.Multinest - INFO - planet_sma, Value: 0.9999999999999999 Type: Uniform, Params: Bounds = [1,2]
+taurex.Multinest - INFO - distance, Value: 1 Type: Uniform, Params: Bounds = [1,22]
+taurex.Multinest - INFO - atm_min_pressure, Value: 0.01 Type: LogUniform, Params: Bounds = [-1.0,0.0]
+taurex.Multinest - INFO - atm_max_pressure, Value: 1000000.0 Type: LogUniform, Params: Bounds = [-1.0,0.0]
+taurex.Multinest - INFO - T, Value: 800.0 Type: Uniform, Params: Bounds = [300.0,2000.0]
+taurex.Multinest - INFO - H2O, Value: 1e-05 Type: LogUniform, Params: Bounds = [-12.0,-1.0]
+taurex.Multinest - INFO - CO2, Value: 1e-05 Type: LogUniform, Params: Bounds = [-12.0,-1.0]
+taurex.Multinest - INFO - He_H2, Value: 0.172 Type: LogUniform, Params: Bounds = [-12.0,-1.0]
+taurex.Multinest - INFO - flat_topP, Value: 100.0 Type: LogUniform, Params: Bounds = [-20.0,0.0]
+taurex.Multinest - INFO - flat_bottomP, Value: -1 Type: LogUniform, Params: Bounds = [-20.0,0.0]
+taurex.Multinest - INFO - flat_mix_ratio, Value: 1000.0 Type: LogUniform, Params: Bounds = [-20.0,0.0]
+taurex.Multinest - INFO - -------DERIVED---------------
+taurex.Multinest - INFO - Derived Parameters available:
+taurex.Multinest - INFO - logg, Value: 0.6457690886843539
+taurex.Multinest - INFO - avg_T, Value: 800.0
+taurex.Multinest - INFO - metallicity, Value: 0.02000021960009744
+taurex.Multinest - INFO - mu, Value: 2.3080208117634124
+taurex.ParamParser - INFO - Setting up optimizer
+taurex.ParamParser - INFO - Fitting: planet_radius
+taurex.ParamParser - INFO - Fitting: T
+taurex.ParamParser - INFO - Fitting: H2O
+taurex.ParamParser - INFO - Fitting: CO2
+taurex.ParamParser - INFO - Fitting: flat_topP
+taurex.Multinest - INFO - 
+taurex.Multinest - INFO - -------------------------------------
+taurex.Multinest - INFO - ------Retrieval Parameters-----------
+taurex.Multinest - INFO - -------------------------------------
+taurex.Multinest - INFO - 
+taurex.Multinest - INFO - Dimensionality of fit: 5
+taurex.Multinest - INFO - 
+taurex.Multinest - INFO - 
+Param            Value  Type        Args
+-------------  -------  ----------  -----------------------
+planet_radius     0.82  Uniform     Bounds = [0.5,1.5]
+T               800     Uniform     Bounds = [200.0,3000.0]
+log_H2O          -5     LogUniform  Bounds = [-12.0,-1.0]
+log_CO2          -5     LogUniform  Bounds = [-12.0,-1.0]
+log_flat_topP     2     LogUniform  Bounds = [-2.0,6.0]
+
+
+taurex.Multinest - INFO - 
+/gpfs/home6/sciarella1/experiments/differentiability/.venv_pytorch/lib64/python3.11/site-packages/taurex/model/transmission.py:185: RuntimeWarning: overflow encountered in square
+  argument = np.where(defined, (c0 + u[index]) ** 2 - p[:, None], 1.0)
+/gpfs/home6/sciarella1/experiments/differentiability/.venv_pytorch/lib64/python3.11/site-packages/taurex/model/transmission.py:465: RuntimeWarning: overflow encountered in multiply
+  integral = np.sum((pradius + ap) * (1.0 - tau) * _dz * 2.0, axis=0)
+/gpfs/home6/sciarella1/experiments/differentiability/.venv_pytorch/lib64/python3.11/site-packages/taurex/model/transmission.py:184: RuntimeWarning: overflow encountered in square
+  p = (c0 + z) ** 2
+/gpfs/home6/sciarella1/experiments/differentiability/.venv_pytorch/lib64/python3.11/site-packages/taurex/model/transmission.py:185: RuntimeWarning: invalid value encountered in subtract
+  argument = np.where(defined, (c0 + u[index]) ** 2 - p[:, None], 1.0)
+/gpfs/home6/sciarella1/experiments/differentiability/.venv_pytorch/lib64/python3.11/site-packages/taurex/model/transmission.py:199: RuntimeWarning: invalid value encountered in subtract
+  m >= layer, 2.0 * (b[layer, offset] - previous[layer, offset]), 0.0
+/gpfs/home6/sciarella1/experiments/differentiability/.venv_pytorch/lib64/python3.11/site-packages/taurex/optimizer/optimizer.py:623: RuntimeWarning: overflow encountered in multiply
+  res = np.nansum(res * res)
+Traceback (most recent call last):
+  File "/gpfs/home6/sciarella1/experiments/differentiability/.venv_pytorch/bin/taurex", line 6, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/gpfs/home6/sciarella1/experiments/differentiability/.venv_pytorch/lib64/python3.11/site-packages/taurex/taurex.py", line 695, in main
+    pass
+       ^^
+  File "/gpfs/home6/sciarella1/experiments/differentiability/.venv_pytorch/lib64/python3.11/site-packages/taurex/optimizer/optimizer.py", line 689, in fit
+    sol_values["Spectra"]["Contributions"] = store_contributions(
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ModuleNotFoundError: No module named 'taurex.util.memory'
+Error: No child process (os error 10)

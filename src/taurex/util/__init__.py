@@ -17,6 +17,7 @@ from .util import get_molecular_weight
 from .util import has_duplicates
 from .util import loadtxt2d
 from .util import mass
+from .util import memory_usage_mb
 from .util import merge_elements
 from .util import molecule_texlabel
 from .util import movingaverage
@@ -30,6 +31,7 @@ from .util import sanitize_molecule_string
 from .util import split_molecule_elements
 from .util import store_thing
 from .util import tokenize_molecule
+from .util import trim_memory
 from .util import weighted_avg_and_std
 from .util import wnwidth_to_wlwidth
 
@@ -67,4 +69,6 @@ __all__ = [
     "has_duplicates",
     "find_closest_pair",
     "ensure_string_utf8",
+    "trim_memory",
+    "memory_usage_mb",
 ]
