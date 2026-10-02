@@ -1,0 +1,370 @@
+[Global]
+xsec_path = ../Inputs/xsec_R1k
+cia_path = ../Inputs/cia
+mpi_use_shared = True
+
+#use_radis = True
+#radis_grid = 1500,12000,200
+
+[Chemistry]
+chemistry_type = free
+#chemistry_type = makefree+freckll
+##chemistry_type = pychegp
+#reduced = True
+#metallicity=1.0
+#co_ratio=0.457
+#maximum_runtime = 3.
+#df_stop = 0.01
+#dfdt_stop = 1e-6
+#t_final = 1e9
+#atol = 1e-18
+#rtol = 1e-3
+#solver = vode
+#o_seq = 0.0
+
+    [[CO2]]
+    gas_type = constant
+    mix_ratio = 1e-5
+    
+    [[H2O]]
+    gas_type = constant
+    mix_ratio = 1e-5
+
+[Temperature]
+limit_slope=8000
+profile_type = npoint
+#profile_type = npoint_adv
+T_surface = 1000
+temperature_points = 990, 980, 970, 960, 950, 500
+pressure_points = 1e5, 1e4, 1e3, 1e2, 1e1, 1e-1
+T_top = 450
+P_top = 1e-3
+#allow_inversions = True
+#profile_type = isothermal
+#T = 1200
+
+[Pressure]
+profile_type = simple
+atm_min_pressure = 1e-2
+atm_max_pressure = 1e6
+nlayers = 80
+
+[Planet]
+planet_type = simple
+planet_mass = 0.12
+planet_radius = 0.82
+
+[Star]
+star_type = blackbody
+radius = 0.676
+temperature = 6400.
+
+[Model]
+model_type = transmission
+#parfiles = m1.par, m2.par
+#fractions = 0.5, 0.5
+
+    [[Absorption]]
+	
+    [[Rayleigh]]
+	
+    [[CIA]]
+    cia_pairs= H2-H2, H2-He
+    
+    [[PyMieScattGridExtinction]]
+    mie_particle_radius_distribution = budaj
+    species = SiO_Wetzel, SiO2, MgSiO3, Mg2SiO4
+    mie_particle_mean_radius = 0.1, 0.1, 0.1, 0.1
+    mie_particle_logstd_radius = 0.5, 0.5, 0.5, 0.05
+    mie_midP = 1e5, 1e5, 1e5, 1e5
+    mie_rangeP = 1, 1, 1, 1
+    mie_porosity = 0.0,0.0,0.0,0.0
+    mie_particle_mix_ratio = 1e-10, 1e-10, 1e-10, 1e-10
+    mie_species_path = ../Inputs/aerosols/SiO_Wetzel_Qext_grid.h5, ../Inputs/aerosols/SiO2_Qext_grid.h5, ../Inputs/aerosols/MgSiO3_Qext_grid.h5, ../Inputs/aerosols/Mg2SiO4_Qext_grid.h5
+    mie_particle_radius_Nsampling = 5
+    mie_particle_altitude_distrib = linear
+    mie_particle_altitude_decay = -5, -5, -5, -5
+    name = 'mie'
+    ##mie_particle_altitude_decay = -5, -5, -5, -5
+    
+    ##[[PyMieScattExtinctionAggregates]]
+    ##mie_particle_mean_radius=0.01 
+    ##mie_particle_logstd_radius = 0.001 ## Serves for the normaly distributed particle size distribution.
+    ###mie_particle_paramA = 1., mie_particle_paramB = 6., mie_particle_paramC = 6., mie_particle_paramD = 1., ## Serves for Deirmendjian particle size distribution.
+    ###mie_particle_radius_Nsampling = 5, mie_particle_radius_Dsampling = 2, ## Is used for sampling the particle distribution.
+    ##mie_particle_radius_distribution = 'budaj' ## choices are 'normal', 'budaj', 'deirmendjian'.
+    ##mie_species_path = /home/dc-chan1/rds/rds-dirac-dp267-PTJ42mkHTWY/Quentin/Inputs/Aerosols/aerosols_virga
+    ##species = SiO_Wetzel, SiO2, MgSiO3
+    ##file_extension = '.refrind'
+    ##mie_particle_mix_ratio = 1e-10 
+    ##mie_filling_factors = 0.01, 0.2, 0.3
+    ##mie_effective_filling_factor = 0.1
+    ##mie_midP = 1e3
+    ##mie_rangeP = 1
+    ##mie_resolution = 100
+    ##mie_particle_altitude_distrib = 'linear'
+    ###mie_particle_altitude_decay = -5, ## Controls the decay rate, inspired by Whitten et al. 2008 / Attreya et al. 2005
+    ##usecols= 1,2,3 
+    ##reverse= 'auto' 
+    ##name = 'Agg'
+    ##renormalize_factors = False
+    
+    #[[PyLeeMieMultiple]]
+    #lee_mie_radius = 0.01,
+    #lee_mie_q = 40,
+    #lee_mie_mix_ratio = 1e1,
+    #lee_mie_midP = 1e1,
+    #lee_mie_rangeP = 1,
+    
+[Observation]
+observation = spectra_w_offsets
+path_spectra = ../Inputs/Spectra/WFC3_FULL_Fiducial_Pegasus_Spectrum.txt, ../Inputs/Spectra/NIRCam_F322W2_Fiducial_Eureka_Spectrum.txt, ../Inputs/Spectra/NIRCam_F444W_Fiducial_Eureka_Spectrum.txt, ../Inputs/Spectra/MIRI_LRS_Fiducial_Eureka_Spectrum.txt,
+# Use line below to cause memory crash for testing
+#path_spectra = Spectra/WFC3_FULL_Fiducial_Pegasus_Spectrum.txt, Spectra/WASP-107b-G395H.txt, Spectra/MIRI_LRS_Fiducial_Eureka_Spectrum.txt,
+
+[Optimizer]
+
+optimizer = multinest
+num_live_points = 302
+evidence_tolerance = 0.8
+resume=True
+verbose_output= True
+search_multi_modes = False
+multi_nest_path = multi
+n_iter_before_update=20
+sigma_fraction = 0.2
+max_iterations=0
+constant_efficiency_mode = True
+
+[Fitting]
+
+#fr_1:fit = True
+#fr_1:bounds = 0, 1
+
+planet_radius:fit = True
+planet_radius:bounds = 0.5, 1.5
+
+Offset_1:fit = True
+Offset_1:bounds = -1000, 1000
+Offset_1:mode = linear
+#Offset_1:prior = "Gaussian(mean=0.0,std=1e-18)"
+
+Offset_4:fit = True
+Offset_4:bounds = -1000, 1000
+Offset_4:mode = linear
+
+#T:fit = True
+#T:bounds = 200, 3000
+
+T_surface:fit = True
+T_surface:bounds = 300, 3000
+
+T_point1:fit = True
+T_point1:bounds = 200,3000
+P_point1:fit = False
+P_point1:bounds = 1e7, 1e0
+
+T_point2:fit = True
+T_point2:bounds = 200,3000
+P_point2:fit = False
+P_point2:bounds = 1e7, 1e0
+
+T_point3:fit = True
+T_point3:bounds = 200,3000
+P_point3:fit = False
+P_point3:bounds = 1e7, 1e0
+
+T_point4:fit = True
+T_point4:bounds = 200,3000
+P_point4:fit = False
+P_point4:bounds = 1e7, 1e0
+
+T_point5:fit = True
+T_point5:bounds = 200,3000
+P_point5:fit = False
+P_point5:bounds = 1e7, 1e0
+
+T_point6:fit = True
+T_point6:bounda = 200, 3-00
+P_point6:fit = False
+
+T_top:fit = True
+T_top:bounds = 200, 3000
+P_top:fit = False
+P_top:bounds = 1e4, 1e-3
+
+#metallicity:fit = True
+#metallicity:bounds = 0.1, 100
+#metallicity:model = log
+
+#C_O_ratio:fit = True
+#C_O_ratio:bounds = 0.02, 2
+#C_O_ratio:mode = linear
+
+#Kzz:fit = True
+#Kzz:bounds = 1e2, 1e14
+#Kzz:mode = log
+
+
+H2O:fit = True
+H2O:bounds = 1e-12, 1e-1
+
+
+#
+#CH4:fit = True
+#CH4:bounds = 1e-10, 1e-2
+#
+#
+CO2:fit = True
+CO2:bounds = 1e-10, 1e-2
+#
+#Na:fit = True
+#Na:bounds = 1e-10, 1e-2
+#
+#K:fit = True
+#K:bounds = 1e-10, 1e-2
+
+
+#m1_midP_Agg:fit = True
+#m1_midP_Agg:bounds = 1e7, 1e-2
+#m1_midP_Agg:mode = log
+#
+#m1_rangeP_Agg:fit = True
+#m1_rangeP_Agg:bounds = 4, 0.2
+#m1_rangeP_Agg:mode = linear
+#
+#m1_Rmean_Agg:fit = True
+#m1_Rmean_Agg:bounds = 1e-2, 4
+#m1_Rmean_Agg:mode = log
+#
+#m1_X_Agg:fit = True
+#m1_X_Agg:bounds = 1, 1e14
+#m1_X_Agg:mode = log
+#
+#m1_Ffill_eff_Agg:fit = True
+#m1_Ffill_eff_Agg:bounds = 1e-5, 1.0
+#m1_Ffill_eff_Agg:mode = log
+#
+####SiO_Wetzel, SiO2
+#m1_Ffill_SiO_Wetzel_Agg:fit = True
+#m1_Ffill_SiO_Wetzel_Agg:bounds = 0.001, 1.0
+#m1_Ffill_SiO_Wetzel_Agg:mode = linear
+#
+#m1_Ffill_SiO2_Agg:fit = True
+#m1_Ffill_SiO2_Agg:bounds = 0.001, 1.0
+#m1_Ffill_SiO2_Agg:mode = linear
+#
+#m1_Ffill_MgSiO3_Agg:fit = True
+#m1_Ffill_MgSiO3_Agg:bounds = 0.001, 1.0
+#m1_Ffill_MgSiO3_Agg:mode = linear
+
+#m1_lee_mie_radius_1:fit = True
+#m1_lee_mie_radius_1:bounds = 1e-4, 100
+#m1_lee_mie_radius_1:mode = log
+#
+#m1_lee_mie_mix_ratio_1:fit = True
+#m1_lee_mie_mix_ratio_1:bounds = 1, 1e16
+#m1_lee_mie_mix_ratio_1:mode = log
+#
+#m1_lee_mie_q_1:fit = True
+#m1_lee_mie_q_1:bounds = 1, 99
+#m1_lee_mie_q_1:mode = linear
+#
+#m1_lee_mie_midP_1:fit = True
+#m1_lee_mie_midP_1:bounds = 1e6, 1e-3
+#m1_lee_mie_midP_1:mode = log
+#
+#m1_lee_mie_rangeP_1:fit = True
+#m1_lee_mie_rangeP_1:bounds = 0.2, 4
+#m1_lee_mie_rangeP_1:mode = linear
+
+midP_share:fit = True
+midP_share:bounds = 1e7, 1e1
+midP_share:mode = log
+
+rangeP_share:fit = True
+rangeP_share:bounds = 4, 1
+rangeP_share:mode = linear
+
+Rmean_SiO_Wetzel:fit = True
+Rmean_SiO_Wetzel:bounds = 1e-2, 4
+Rmean_SiO_Wetzel:mode = log
+#
+X_SiO_Wetzel:fit = True
+X_SiO_Wetzel:bounds = 1, 1e14
+X_SiO_Wetzel:mode = log
+#
+#m1_Porosity_ZnS_mie:fit = True
+#m1_Porosity_ZnS_mie:bounds = 0,1
+#
+rangeP_SiO_Wetzel:fit = True
+rangeP_SiO_Wetzel:bounds = 4, 1
+rangeP_SiO_Wetzel:mode = linear
+#
+midP_SiO_Wetzel:fit = True
+midP_SiO_Wetzel:bounds = 1e7, 1e-3
+midP_SiO_Wetzel:mode = log
+
+
+Rmean_SiO2:fit = True
+Rmean_SiO2:bounds = 1e-2, 4
+Rmean_SiO2:mode = log
+#
+X_SiO2:fit = True
+X_SiO2:bounds = 1, 1e14
+X_SiO2:mode = log
+#
+#m1_Porosity_ZnS_mie:fit = True
+#m1_Porosity_ZnS_mie:bounds = 0,1
+#
+rangeP_SiO2:fit = True
+rangeP_SiO2:bounds = 4, 1
+rangeP_SiO2:mode = linear
+#
+midP_SiO2:fit = True
+midP_SiO2:bounds = 1e7, 1e-3
+midP_SiO2:mode = log
+
+
+Rmean_MgSiO3:fit = True
+Rmean_MgSiO3:bounds = 1e-2, 4
+Rmean_MgSiO3:mode = log
+#
+X_MgSiO3:fit = True
+X_MgSiO3:bounds = 1, 1e14
+X_MgSiO3:mode = log
+#
+#m1_Porosity_ZnS_mie:fit = True
+#m1_Porosity_ZnS_mie:bounds = 0,1
+#
+rangeP_MgSiO3:fit = True
+rangeP_MgSiO3:bounds = 4, 1
+rangeP_MgSiO3:mode = linear
+#
+midP_MgSiO3:fit = True
+midP_MgSiO3:bounds = 1e7, 1e-3
+midP_MgSiO3:mode = log
+
+
+Rmean_Mg2SiO4:fit = True
+Rmean_Mg2SiO4:bounds = 1e-2, 4
+Rmean_Mg2SiO4:mode = log
+#
+X_Mg2SiO4:fit = True
+X_Mg2SiO4:bounds = 1, 1e14
+X_Mg2SiO4:mode = log
+#
+#m1_Porosity_ZnS_mie:fit = True
+#m1_Porosity_ZnS_mie:bounds = 0,1
+#
+rangeP_Mg2SiO4:fit = True
+rangeP_Mg2SiO4:bounds = 4, 1
+rangeP_Mg2SiO4:mode = linear
+#
+midP_Mg2SiO4:fit = True
+midP_Mg2SiO4:bounds = 1e7, 1e-3
+midP_Mg2SiO4:mode = log
+
+
+
+
