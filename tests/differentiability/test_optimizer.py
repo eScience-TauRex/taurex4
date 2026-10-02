@@ -9,7 +9,8 @@ the Laplace approximation reports actually bracket the truth.
 import numpy as np
 import pytest
 
-from taurex.differentiability import Atmosphere, LaplaceOptimizer
+from taurex.differentiability import Atmosphere
+from taurex.differentiability import LaplaceOptimizer
 
 
 jax = pytest.importorskip("jax")
@@ -76,9 +77,14 @@ def test_map_recovers_injected_parameters(optimizer, taurex_model, observation):
     optimizer.compute_fit()
 
     np.testing.assert_allclose(optimizer._map, TRUTH, rtol=0.0, atol=1e-4)
-    assert float(
-        optimizer.atmosphere.chi_squared(jnp.asarray(optimizer._map, dtype=jnp.float64))
-    ) < 1e-6
+    assert (
+        float(
+            optimizer.atmosphere.chi_squared(
+                jnp.asarray(optimizer._map, dtype=jnp.float64)
+            )
+        )
+        < 1e-6
+    )
 
 
 def test_map_is_the_minimum(optimizer, taurex_model, observation):
@@ -90,9 +96,7 @@ def test_map_is_the_minimum(optimizer, taurex_model, observation):
     optimizer.update_model(start)
     optimizer.compute_fit()
     perturbed = float(
-        optimizer.atmosphere.chi_squared(
-            jnp.asarray(optimizer._map, dtype=jnp.float64)
-        )
+        optimizer.atmosphere.chi_squared(jnp.asarray(optimizer._map, dtype=jnp.float64))
     )
 
     optimizer.update_model(TRUTH)
@@ -149,7 +153,9 @@ def test_solution_exposes_map_and_median(optimizer, taurex_model, observation):
     assert index == 0
     assert extra == []
     np.testing.assert_allclose(map_values, optimizer._map)
-    np.testing.assert_allclose(median_values, np.median(optimizer.get_samples(0), axis=0))
+    np.testing.assert_allclose(
+        median_values, np.median(optimizer.get_samples(0), axis=0)
+    )
 
 
 def test_reported_timings_and_counts(optimizer, taurex_model, observation):
@@ -189,3 +195,241 @@ def test_gaussian_prior_is_used(taurex_model, observation):
 
     # The prior is three hundred times narrower than the likelihood, so it wins.
     assert optimizer._map[2] == pytest.approx(1e-5, rel=1e-2)
+
+
+def test_observation_is_a_traced_argument(taurex_model, observation):
+    """The likelihood is a pure function of the data, so a program is reusable."""
+    optimizer = LaplaceOptimizer(num_samples=20)
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    for name in NAMES:
+        optimizer.enable_fit(name)
+
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    likelihood_of = jax.jit(
+        lambda theta, data, error: atmosphere.log_likelihood(
+            theta, data=data, error=error
+        )
+    )
+    theta = jnp.asarray(TRUTH, dtype=jnp.float64)
+    data = atmosphere.observation
+    error = atmosphere.errors
+
+    same = float(likelihood_of(theta, data, error))
+    again = float(likelihood_of(theta, data * 1.0, error))
+    assert again == pytest.approx(same, rel=1e-12)
+
+    # A different observation is the same compiled program with a new input.
+    other = float(likelihood_of(theta, data, error * 2.0))
+    assert other != pytest.approx(same, rel=1e-6)
+
+
+def test_multi_start_finds_the_mode(taurex_model, observation):
+    """Several perturbed starts converge to the same identifiable optimum."""
+    optimizer = LaplaceOptimizer(num_samples=100, max_iterations=100, n_starts=5)
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    optimizer.enable_fit("planet_radius")
+
+    truth = np.array([1.07])
+    optimizer.update_model(truth)
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    data = np.asarray(atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64)))
+    observation._obs_spectrum[:, 1] = data
+
+    optimizer.update_model(np.array([1.25]))
+    optimizer.compute_fit()
+
+    np.testing.assert_allclose(optimizer._map, truth, rtol=0.0, atol=1e-4)
+    assert optimizer.iterations > 0
+
+
+def test_multi_start_beats_a_single_bad_start(taurex_model, observation):
+    """On a degenerate model the restarts still land on the exact fit."""
+    optimizer = LaplaceOptimizer(num_samples=100, max_iterations=100, n_starts=4)
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    for name in NAMES:
+        optimizer.enable_fit(name)
+
+    make_data(optimizer, taurex_model, observation, TRUTH)
+    optimizer.update_model(np.array([1.30, 850.0, -3.5]))
+    optimizer.compute_fit()
+
+    # Radius, temperature and abundance are degenerate in a narrow noiseless
+    # window, so the check is that a perfect fit was found, not which point.
+    assert (
+        float(
+            optimizer.atmosphere.chi_squared(
+                jnp.asarray(optimizer._map, dtype=jnp.float64)
+            )
+        )
+        < 1e-6
+    )
+
+
+def test_nuts_recovers_the_posterior(taurex_model, observation):
+    """NUTS returns a posterior that agrees with the Laplace approximation.
+
+    A single, identifiable parameter is used so that the posterior is a
+    well-defined Gaussian; on the three parameter fit the radius / absorption
+    degeneracy makes the marginal median legitimately differ from the mode.
+    """
+    optimizer = LaplaceOptimizer(
+        num_samples=400,
+        max_iterations=100,
+        sampler="nuts",
+        num_warmup=300,
+        num_chains=2,
+    )
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    optimizer.enable_fit("planet_radius")
+
+    truth = np.array([1.07])
+    optimizer.update_model(truth)
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    clean = np.asarray(atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64)))
+    generator = np.random.default_rng(3)
+    observation._obs_spectrum[:, 1] = clean + generator.normal(0.0, 1e-4, clean.shape)
+    optimizer.update_model(truth)
+    optimizer.compute_fit()
+
+    samples = optimizer.get_samples(0)
+    assert samples.ndim == 2
+    assert samples.shape[1] == 1
+    assert samples.shape[0] > 0
+
+    sigma = samples.std(axis=0)
+    assert np.all(np.isfinite(sigma))
+    assert np.all(sigma > 0.0)
+    # The posterior is roughly Gaussian here, so the sampling error bar and the
+    # Laplace one describe the same thing.
+    laplace_sigma = np.sqrt(np.diag(optimizer.covariance))
+    np.testing.assert_allclose(sigma, laplace_sigma, rtol=0.6)
+    # The median sits within a few sigma of the injected truth.
+    assert np.all(np.abs(optimizer._median - truth) / sigma < 4.0)
+    # The chain actually moved: not all draws are the same point.
+    assert samples[0].tolist() != samples[-1].tolist()
+
+
+def test_jitter_absorbs_underreported_errors(taurex_model, observation):
+    """A fitted jitter recovers noise the input error bars under-report."""
+    optimizer = LaplaceOptimizer(num_samples=200, max_iterations=200, jitter=True)
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    for name in NAMES:
+        optimizer.enable_fit(name)
+
+    truth = np.array([1.05, 950.0, np.log10(3e-4)])
+    optimizer.update_model(truth)
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    clean = np.asarray(atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64)))
+    generator = np.random.default_rng(4)
+    noise = generator.normal(0.0, 5e-5, clean.shape)
+    # The input file claims a per-bin error an order of magnitude too small.
+    observation._obs_spectrum[:, 1] = clean + noise
+    observation._obs_spectrum[:, 2] = 1e-5
+    optimizer.update_model(truth)
+
+    optimizer.compute_fit()
+
+    assert optimizer.jitter_map is not None
+    excess = np.sqrt(5e-5**2 - 1e-5**2)
+    assert 0.4 * excess < optimizer.jitter_map < 2.0 * excess
+
+
+def test_profile_bands_match_the_numpy_model(taurex_model, observation):
+    """The vmap post-processing reproduces the numpy compute_error variances."""
+    optimizer = LaplaceOptimizer(num_samples=300, max_iterations=100)
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    for name in NAMES:
+        optimizer.enable_fit(name)
+
+    make_data(optimizer, taurex_model, observation, TRUTH, noise=3e-5)
+    optimizer.compute_fit()
+
+    jax_profiles, jax_spectra = optimizer.generate_profiles(
+        0, observation.wavenumberGrid
+    )
+
+    samples = optimizer.get_samples(0)
+    binner = observation.create_binner()
+
+    def sample_iter():
+        for parameters in samples:
+            optimizer.update_model(parameters)
+            yield 1.0
+
+    numpy_profiles, numpy_spectra = taurex_model.compute_error(
+        sample_iter, wngrid=observation.wavenumberGrid, binner=binner
+    )
+
+    for key, value in jax_profiles.items():
+        np.testing.assert_allclose(value, numpy_profiles[key], rtol=1e-6, atol=1e-12)
+    # The native spectrum of the differentiable model lives on the grid clipped
+    # to the observation, which is shorter than the numpy native grid, so only
+    # the binned band and the shape of the native band are compared.
+    np.testing.assert_allclose(
+        jax_spectra["binned_std"], numpy_spectra["binned_std"], rtol=1e-6, atol=1e-14
+    )
+    assert jax_spectra["native_std"].shape == (optimizer.atmosphere.wngrid.shape[0],)
+    assert np.all(np.isfinite(jax_spectra["native_std"]))
+    assert np.all(jax_spectra["native_std"] > 0.0)
+
+
+def test_fisher_information_bounds_the_errors(taurex_model, observation):
+    """The Fisher information is positive semi-definite and bounds the errors."""
+    optimizer = LaplaceOptimizer(num_samples=300, max_iterations=100)
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    for name in NAMES:
+        optimizer.enable_fit(name)
+
+    make_data(optimizer, taurex_model, observation, TRUTH, noise=1e-5)
+    optimizer.compute_fit()
+
+    fisher = optimizer.fisher_information()
+    assert fisher.shape == (len(NAMES), len(NAMES))
+    np.testing.assert_allclose(fisher, fisher.T, rtol=1e-10)
+
+    eigenvalues = np.linalg.eigvalsh(fisher)
+    # Positive semi-definite. The near-null directions are the radius /
+    # absorption degeneracy of a transmission spectrum in a narrow window, and
+    # exposing them is the point of the diagnostic.
+    assert np.all(eigenvalues > -1e-8 * eigenvalues.max())
+    assert eigenvalues.max() > 0.0
+
+
+def test_fisher_sigma_matches_the_laplace_sigma(taurex_model, observation):
+    """With one non-degenerate parameter the bound agrees with the fit."""
+    optimizer = LaplaceOptimizer(num_samples=300, max_iterations=100)
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    optimizer.enable_fit("planet_radius")
+
+    truth = np.array([1.07])
+    optimizer.update_model(truth)
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    clean = np.asarray(atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64)))
+    generator = np.random.default_rng(7)
+    observation._obs_spectrum[:, 1] = clean + generator.normal(0.0, 1e-5, clean.shape)
+    optimizer.update_model(truth)
+    optimizer.compute_fit()
+
+    fisher = optimizer.fisher_information()
+    assert fisher.shape == (1, 1)
+    fisher_sigma = 1.0 / np.sqrt(np.diag(fisher))
+    sample_sigma = optimizer.get_samples(0).std(axis=0)
+    np.testing.assert_allclose(fisher_sigma, sample_sigma, rtol=0.5)

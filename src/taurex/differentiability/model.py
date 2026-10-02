@@ -27,9 +27,9 @@ transferred again.
 
 import typing as t
 
-import numpy as np
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from taurex.contributions import AbsorptionContribution
 from taurex.contributions import CIAContribution
@@ -701,6 +701,21 @@ class Atmosphere:
         self._build_opacities()
         self._build_contributions()
 
+    @property
+    def observation(self) -> t.Optional[Array]:
+        """Observed spectrum the likelihood is built against, in JAX arrays."""
+        return self._data
+
+    @property
+    def errors(self) -> t.Optional[Array]:
+        """Per-bin uncertainty of the observation, in JAX arrays."""
+        return self._error
+
+    @property
+    def binning_matrix(self) -> t.Optional[Array]:
+        """Linear binning operator, or None when the model is on the native grid."""
+        return self._binning_matrix
+
     # ------------------------------------------------------------------
     # Construction
     # ------------------------------------------------------------------
@@ -733,7 +748,8 @@ class Atmosphere:
 
     def _prior(self, name: str):
         """Prior object of a fitted parameter."""
-        from taurex.core.priors import LogUniform, Uniform
+        from taurex.core.priors import LogUniform
+        from taurex.core.priors import Uniform
 
         if name in self._priors:
             return self._priors[name]
@@ -807,7 +823,8 @@ class Atmosphere:
 
     def _build_geometry(self) -> None:
         """Cache the pressure grid, planet constants and the working grid."""
-        from taurex.constants import MJUP, RJUP
+        from taurex.constants import MJUP
+        from taurex.constants import RJUP
         from taurex.util import clip_native_to_wngrid
 
         model = self.model
@@ -829,13 +846,19 @@ class Atmosphere:
 
         native_grid = np.asarray(model.nativeWavenumberGrid)
         if self.observed is not None:
-            native_grid = clip_native_to_wngrid(native_grid, self.observed.wavenumberGrid)
+            native_grid = clip_native_to_wngrid(
+                native_grid, self.observed.wavenumberGrid
+            )
 
         self.wngrid = native_grid
         self._n_wavenumbers = native_grid.shape[0]
 
         chemistry = model.chemistry
         self._mix_names = set(chemistry.gases)
+        # Active and inactive gases in the order the numpy chemistry reports
+        # them, so a batched profile band lines up with compute_error.
+        self._active_names = list(chemistry.activeGases)
+        self._inactive_names = list(chemistry.inactiveGases)
 
     def _build_observation(self) -> None:
         """Build the binning operator and cache the observed spectrum."""
@@ -860,12 +883,8 @@ class Atmosphere:
             )
         self.binning = binner
 
-        self._data = physics.as_array(
-            self.observed.spectrum.ravel(), dtype=self.dtype
-        )
-        self._error = physics.as_array(
-            self.observed.errorBar.ravel(), dtype=self.dtype
-        )
+        self._data = physics.as_array(self.observed.spectrum.ravel(), dtype=self.dtype)
+        self._error = physics.as_array(self.observed.errorBar.ravel(), dtype=self.dtype)
         # Fixed for the lifetime of the object, so the normalisation of the
         # likelihood is folded into a python float here instead of being
         # recomputed inside every traced evaluation.
@@ -1087,9 +1106,7 @@ class Atmosphere:
 
         profile = self.model.temperature
         if isinstance(profile, Isothermal):
-            return self._value(values, "T") * jnp.ones(
-                self._n_layers, dtype=self.dtype
-            )
+            return self._value(values, "T") * jnp.ones(self._n_layers, dtype=self.dtype)
 
         if isinstance(profile, NPoint):
             surface = self._node_pressure(
@@ -1100,20 +1117,14 @@ class Atmosphere:
             pressure_nodes = jnp.stack(
                 [
                     surface,
-                    *[
-                        self._value(values, f"P_point{i + 1}")
-                        for i in range(n_points)
-                    ],
+                    *[self._value(values, f"P_point{i + 1}") for i in range(n_points)],
                     top,
                 ]
             )
             temperature_nodes = jnp.stack(
                 [
                     self._value(values, "T_surface"),
-                    *[
-                        self._value(values, f"T_point{i + 1}")
-                        for i in range(n_points)
-                    ],
+                    *[self._value(values, f"T_point{i + 1}") for i in range(n_points)],
                     self._value(values, "T_top"),
                 ]
             )
@@ -1193,7 +1204,9 @@ class Atmosphere:
         if self._has("planet_radius"):
             radius = self._value(values, "planet_radius") * self._r_jup
         else:
-            radius = physics.as_array(planet.get_planet_radius(unit="m"), dtype=self.dtype)
+            radius = physics.as_array(
+                planet.get_planet_radius(unit="m"), dtype=self.dtype
+            )
         if self._has("planet_mass"):
             mass = self._value(values, "planet_mass") * self._m_jup
         else:
@@ -1277,6 +1290,37 @@ class Atmosphere:
         depth = (planet_radius**2 + integral) / self._star_radius**2
         return depth, tau, temperature
 
+    def profile_state(self, theta: Array) -> t.Tuple[Array, Array, Array, Array]:
+        """Per-layer quantities the profile uncertainties are built from.
+
+        Returns the same arrays :class:`~taurex.model.SimpleForwardModel`
+        accumulates in :meth:`compute_error` - the temperature profile, the
+        active and inactive mixing ratio profiles and the native transit depth
+        - but as one traceable call, so :func:`jax.vmap` can evaluate all the
+        posterior draws at once instead of looping the numpy model.
+
+        Parameters
+        ----------
+        theta:
+            Fitted parameters in prior space
+
+        Returns
+        -------
+        temperature, active, inactive, depth:
+            Temperature per layer ``(nlayers,)``, active mixing ratios
+            ``(nactive, nlayers)``, inactive mixing ratios
+            ``(ninactive, nlayers)`` and the native transit depth
+            ``(nwavenumbers,)``
+
+        """
+        values = self._parameters(theta)
+        temperature = self._temperature(values)
+        mix, _ = self._chemistry(values)
+        depth, _, _ = self.forward(theta)
+        active = jnp.stack([mix[name] for name in self._active_names])
+        inactive = jnp.stack([mix[name] for name in self._inactive_names])
+        return temperature, active, inactive, depth
+
     @staticmethod
     def _boltzmann() -> float:
         """Boltzmann constant in J/K."""
@@ -1320,13 +1364,30 @@ class Atmosphere:
             return depth
         return self._binning_matrix @ depth
 
-    def chi_squared(self, theta: Array) -> Array:
+    def chi_squared(
+        self,
+        theta: Array,
+        data: t.Optional[Array] = None,
+        error: t.Optional[Array] = None,
+    ) -> Array:
         """Chi-squared against the observation.
+
+        ``data`` and ``error`` default to the observation the object was built
+        with. Passing them lets the same compiled program be reused for a
+        different dataset - a noise injection, or a jitter inflated error bar -
+        without retracing, because the observation stops being a compile time
+        constant.
 
         Parameters
         ----------
         theta:
             Fitted parameters in prior space
+
+        data:
+            Observed spectrum to fit; the built in observation when None
+
+        error:
+            1 sigma uncertainty per bin; the built in errors when None
 
         Returns
         -------
@@ -1334,10 +1395,19 @@ class Atmosphere:
             Scalar chi-squared
 
         """
-        residual = (self._data - self.spectrum(theta)) / self._error
+        if data is None:
+            data = self._data
+        if error is None:
+            error = self._error
+        residual = (data - self.spectrum(theta)) / error
         return jnp.sum(residual * residual)
 
-    def log_likelihood(self, theta: Array) -> Array:
+    def log_likelihood(
+        self,
+        theta: Array,
+        data: t.Optional[Array] = None,
+        error: t.Optional[Array] = None,
+    ) -> Array:
         """Log likelihood, matching the convention of the taurex optimizers.
 
         Parameters
@@ -1345,10 +1415,28 @@ class Atmosphere:
         theta:
             Fitted parameters in prior space
 
+        data:
+            Observed spectrum to fit; the built in observation when None
+
+        error:
+            1 sigma uncertainty per bin; the built in errors when None. A
+            traced error is what lets a jitter term be fitted, and it re-derives
+            the normalisation from those errors rather than using the value
+            cached at construction.
+
         Returns
         -------
         :obj:`jax.Array`
             Scalar log likelihood
 
         """
-        return -self._log_normalisation - 0.5 * self.chi_squared(theta)
+        if data is None and error is None:
+            return -self._log_normalisation - 0.5 * self.chi_squared(theta)
+        if data is None:
+            data = self._data
+        if error is None:
+            error = self._error
+        normalisation = jnp.sum(jnp.log(error)) + error.shape[0] * 0.5 * jnp.log(
+            2.0 * jnp.pi
+        )
+        return -normalisation - 0.5 * self.chi_squared(theta, data=data, error=error)
