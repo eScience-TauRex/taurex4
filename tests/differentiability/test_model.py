@@ -14,7 +14,8 @@ import pytest
 
 from taurex.differentiability import Atmosphere
 
-from .conftest import build_model, compile_fit_params
+from .conftest import build_model
+from .conftest import compile_fit_params
 
 
 jax = pytest.importorskip("jax")
@@ -166,7 +167,9 @@ def test_npoint_temperature_compiles_and_matches_numpy(
     np.testing.assert_allclose(np.asarray(depth), expected, rtol=1e-10, atol=0.0)
 
 
-def test_native_grid_is_clipped_to_the_observation(data_path, taurex_model, observation):
+def test_native_grid_is_clipped_to_the_observation(
+    data_path, taurex_model, observation
+):
     """Only the part of the native grid the observation covers is modelled."""
     from taurex.util import clip_native_to_wngrid
 

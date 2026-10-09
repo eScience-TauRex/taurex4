@@ -307,9 +307,7 @@ def linear_interp_nd(
 
     x_lo = xp[lower]
     x_hi = xp[upper]
-    weight = _safe_ratio(x - x_lo, x_hi - x_lo).reshape(
-        x.shape + (1,) * (fp.ndim - 1)
-    )
+    weight = _safe_ratio(x - x_lo, x_hi - x_lo).reshape(x.shape + (1,) * (fp.ndim - 1))
 
     y_lo = fp[lower]
     y_hi = fp[upper]
@@ -439,7 +437,8 @@ def altitude_gravity_scaleheight(
         Thickness of each layer in m, shape ``(nlayers,)``
 
     """
-    from taurex.constants import G, KBOLTZ
+    from taurex.constants import KBOLTZ
+    from taurex.constants import G
 
     n_layers = temperature.shape[0]
     zero = jnp.zeros((), dtype=temperature.dtype)

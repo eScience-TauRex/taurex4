@@ -25,7 +25,7 @@ chemistry_type = free
     [[CO2]]
     gas_type = constant
     mix_ratio = 1e-5
-    
+
     [[H2O]]
     gas_type = constant
     mix_ratio = 1e-5
@@ -65,12 +65,12 @@ model_type = transmission
 #fractions = 0.5, 0.5
 
     [[Absorption]]
-	
+
     [[Rayleigh]]
-	
+
     [[CIA]]
     cia_pairs= H2-H2, H2-He
-    
+
     [[PyMieScattGridExtinction]]
     mie_particle_radius_distribution = budaj
     species = SiO_Wetzel, SiO2, MgSiO3, Mg2SiO4
@@ -86,9 +86,9 @@ model_type = transmission
     mie_particle_altitude_decay = -5, -5, -5, -5
     name = 'mie'
     ##mie_particle_altitude_decay = -5, -5, -5, -5
-    
+
     ##[[PyMieScattExtinctionAggregates]]
-    ##mie_particle_mean_radius=0.01 
+    ##mie_particle_mean_radius=0.01
     ##mie_particle_logstd_radius = 0.001 ## Serves for the normaly distributed particle size distribution.
     ###mie_particle_paramA = 1., mie_particle_paramB = 6., mie_particle_paramC = 6., mie_particle_paramD = 1., ## Serves for Deirmendjian particle size distribution.
     ###mie_particle_radius_Nsampling = 5, mie_particle_radius_Dsampling = 2, ## Is used for sampling the particle distribution.
@@ -96,7 +96,7 @@ model_type = transmission
     ##mie_species_path = /home/dc-chan1/rds/rds-dirac-dp267-PTJ42mkHTWY/Quentin/Inputs/Aerosols/aerosols_virga
     ##species = SiO_Wetzel, SiO2, MgSiO3
     ##file_extension = '.refrind'
-    ##mie_particle_mix_ratio = 1e-10 
+    ##mie_particle_mix_ratio = 1e-10
     ##mie_filling_factors = 0.01, 0.2, 0.3
     ##mie_effective_filling_factor = 0.1
     ##mie_midP = 1e3
@@ -104,18 +104,18 @@ model_type = transmission
     ##mie_resolution = 100
     ##mie_particle_altitude_distrib = 'linear'
     ###mie_particle_altitude_decay = -5, ## Controls the decay rate, inspired by Whitten et al. 2008 / Attreya et al. 2005
-    ##usecols= 1,2,3 
-    ##reverse= 'auto' 
+    ##usecols= 1,2,3
+    ##reverse= 'auto'
     ##name = 'Agg'
     ##renormalize_factors = False
-    
+
     #[[PyLeeMieMultiple]]
     #lee_mie_radius = 0.01,
     #lee_mie_q = 40,
     #lee_mie_mix_ratio = 1e1,
     #lee_mie_midP = 1e1,
     #lee_mie_rangeP = 1,
-    
+
 [Observation]
 observation = spectra_w_offsets
 path_spectra = ../Inputs/Spectra/WFC3_FULL_Fiducial_Pegasus_Spectrum.txt, ../Inputs/Spectra/NIRCam_F322W2_Fiducial_Eureka_Spectrum.txt, ../Inputs/Spectra/NIRCam_F444W_Fiducial_Eureka_Spectrum.txt, ../Inputs/Spectra/MIRI_LRS_Fiducial_Eureka_Spectrum.txt,
@@ -364,7 +364,3 @@ rangeP_Mg2SiO4:mode = linear
 midP_Mg2SiO4:fit = True
 midP_Mg2SiO4:bounds = 1e7, 1e-3
 midP_Mg2SiO4:mode = log
-
-
-
-

@@ -24,7 +24,7 @@ def cross_sections() -> np.ndarray:
     pressure = PRESSURE_GRID[:, None, None]
     wavenumber = WAVENUMBER_GRID[None, None, :]
 
-    band = np.exp(-((wavenumber - 2350.0) / 60.0) ** 2)
+    band = np.exp(-(((wavenumber - 2350.0) / 60.0) ** 2))
     scale = 1e-18 * band + 1e-21
     # The temperature and pressure dependence is not separable, which is what
     # gives every fitting parameter a distinct spectral signature.
@@ -36,7 +36,9 @@ def data_path(tmp_path):
     """Write synthetic opacity and CIA tables and point taurex at them."""
     import h5py
 
-    from taurex.cache import CIACache, GlobalCache, OpacityCache
+    from taurex.cache import CIACache
+    from taurex.cache import GlobalCache
+    from taurex.cache import OpacityCache
 
     opacity_file = tmp_path / "1H2-16O__synth.R1000_2-5mu.xsec.TauREx.h5"
     with h5py.File(opacity_file, "w") as handle:
@@ -47,10 +49,13 @@ def data_path(tmp_path):
         handle.create_dataset("xsecarr", data=cross_sections())
         handle.create_dataset("mol_name", data=np.array([b"H2O"]))
 
-    cia_table = np.outer(
-        1.0 + 200.0 / TEMPERATURE_GRID,
-        np.exp(-((WAVENUMBER_GRID - 2400.0) / 150.0) ** 2),
-    ) * 1e-40
+    cia_table = (
+        np.outer(
+            1.0 + 200.0 / TEMPERATURE_GRID,
+            np.exp(-(((WAVENUMBER_GRID - 2400.0) / 150.0) ** 2)),
+        )
+        * 1e-40
+    )
     # The CIA cache looks for .db files and takes the pair name from the stem.
     with open(tmp_path / "H2-H2.db", "wb") as handle:
         pickle.dump(
@@ -116,7 +121,8 @@ def build_model(temperature_profile=None):
     from taurex.contributions import FlatMieContribution
     from taurex.contributions import RayleighContribution
     from taurex.data import Planet
-    from taurex.data.profiles.chemistry import ConstantGas, TaurexChemistry
+    from taurex.data.profiles.chemistry import ConstantGas
+    from taurex.data.profiles.chemistry import TaurexChemistry
     from taurex.data.profiles.pressure import SimplePressureProfile
     from taurex.data.profiles.temperature import Isothermal
     from taurex.data.stellar import BlackbodyStar

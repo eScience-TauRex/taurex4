@@ -50,6 +50,12 @@ from .model import Atmosphere
 
 Array = jax.Array
 
+_PROFILE_BATCH_BYTES = 8 * 1024 * 1024
+"""Working set the batched profile evaluation is allowed to use."""
+
+_PROFILE_ARRAYS_PER_DRAW = 5
+"""Roughly how many ``(nlayers, nwn)`` arrays one forward pass keeps live."""
+
 
 class PriorTransform:
     """Cube to parameter map built from a taurex prior.
@@ -880,9 +886,31 @@ class LaplaceOptimizer(Optimizer):
             return super().generate_profiles(solution, binning)
 
         atmosphere = self.atmosphere
+        # The draws are evaluated inside the compiled program, in a batch
+        # bounded by a fixed budget. One vmapped call would put every draw's
+        # working set in memory at once - several ``(nlayers, nwn)`` arrays
+        # each - which is gigabytes for a few thousand draws of a normal
+        # atmosphere, all of it for four small variance vectors.
+        # :func:`jax.lax.map` loops instead, so only a batch is resident, and
+        # sizing the batch from the model rather than fixing a count keeps the
+        # working set bounded whatever the atmosphere looks like. The loop
+        # stays inside the compiled program, which a python loop over batches
+        # does not.
+        per_draw = (
+            atmosphere.wngrid.dtype.itemsize
+            * atmosphere.model.nLayers
+            * atmosphere.wngrid.shape[0]
+            * _PROFILE_ARRAYS_PER_DRAW
+        )
+        batch = max(1, _PROFILE_BATCH_BYTES // max(per_draw, 1))
+
+        def profile_of(draws: Array) -> t.Tuple[Array, Array, Array, Array]:
+            return jax.lax.map(atmosphere.profile_state, draws, batch_size=batch)
+
         theta = jnp.asarray(self._samples, dtype=jnp.float64)
-        profile_of = jax.jit(jax.vmap(atmosphere.profile_state), device=self.device)
-        temperature, active, inactive, depth = jax.block_until_ready(profile_of(theta))
+        temperature, active, inactive, depth = jax.block_until_ready(
+            jax.jit(profile_of, device=self.device)(theta)
+        )
 
         profile_dict = {
             "temp_profile_std": np.asarray(jnp.std(temperature, axis=0)),
@@ -891,7 +919,9 @@ class LaplaceOptimizer(Optimizer):
         }
         spectrum_dict = {"native_std": np.asarray(jnp.std(depth, axis=0))}
         if atmosphere.binning_matrix is not None:
-            binned = jax.vmap(lambda value: atmosphere.binning_matrix @ value)(depth)
+            # One batched product instead of a vmap over the draws: the
+            # operator is a plain matrix so there is nothing to map.
+            binned = jnp.matmul(depth, atmosphere.binning_matrix.T)
             spectrum_dict["binned_std"] = np.asarray(jnp.std(binned, axis=0))
         return profile_dict, spectrum_dict
 

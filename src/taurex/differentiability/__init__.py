@@ -16,7 +16,8 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 from .model import Atmosphere  # noqa: E402
-from .optimizer import LaplaceOptimizer, PriorTransform  # noqa: E402
+from .optimizer import LaplaceOptimizer  # noqa: E402
+from .optimizer import PriorTransform
 
 
 __all__ = ["Atmosphere", "LaplaceOptimizer", "PriorTransform"]

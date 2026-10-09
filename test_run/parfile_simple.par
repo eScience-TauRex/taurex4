@@ -43,16 +43,16 @@ temperature = 6400.
 model_type = transmission
 
     [[Absorption]]
-	
+
     [[Rayleigh]]
-	
+
     [[CIA]]
     cia_pairs= H2-H2, H2-He
 
     [[FlatMie]]
     flat_mix_ratio = 1000
-    flat_topP = 1e2  
-    
+    flat_topP = 1e2
+
 [Observation]
 observed_spectrum = WFC3_G141_Fiducial_Pegasus_Spectrum.txt
 

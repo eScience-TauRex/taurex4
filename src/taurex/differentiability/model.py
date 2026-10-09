@@ -131,6 +131,52 @@ class GridResampler:
         self._below = jnp.asarray(target < source[0])
         self._above = jnp.asarray(target > source[-1])
 
+        # The same indices and weights in numpy. Tables are resampled before
+        # they ever become device arrays, so that a table with many wavenumber
+        # points is never copied over in full just to be reduced onto the
+        # working grid.
+        self._np_lower = lower.astype(np.intp)
+        self._np_upper = upper.astype(np.intp)
+        self._np_weight = weight
+        self._np_below = target < source[0]
+        self._np_above = target > source[-1]
+
+    def apply_numpy(self, values: np.ndarray) -> np.ndarray:
+        """Resample ``values`` along its last axis in numpy.
+
+        Same interpolation as :func:`apply`, on a plain array. Used while
+        building the model, where the tables are still host arrays.
+
+        Parameters
+        ----------
+        values:
+            Array whose last axis is the source grid
+
+        Returns
+        -------
+        :obj:`numpy.ndarray`
+            Array whose last axis is the target grid
+
+        """
+        if self.identity:
+            return values
+
+        weight = self._np_weight.reshape((1,) * (values.ndim - 1) + (-1,))
+        lower = np.take(values, self._np_lower, axis=-1)
+        upper = np.take(values, self._np_upper, axis=-1)
+        result = lower + weight * (upper - lower)
+
+        shape = (1,) * (values.ndim - 1) + (-1,)
+        if self.hold:
+            low_fill = np.broadcast_to(values[..., :1], result.shape)
+            high_fill = np.broadcast_to(values[..., -1:], result.shape)
+        else:
+            low_fill = np.zeros_like(result)
+            high_fill = np.zeros_like(result)
+
+        result = np.where(self._np_below.reshape(shape), low_fill, result)
+        return np.where(self._np_above.reshape(shape), high_fill, result)
+
     def apply(self, values: Array) -> Array:
         """Resample ``values`` along its last axis.
 
@@ -945,12 +991,18 @@ class Atmosphere:
 
     def _resample_table(
         self,
-        table: Array,
+        table: np.ndarray,
         source: np.ndarray,
         hold: t.Optional[bool] = None,
         subset: t.Optional[np.ndarray] = None,
     ) -> Array:
         """Resample a table onto the working wavenumber grid.
+
+        The interpolation is done on the host array and only the resampled
+        result is handed to JAX. Resampling after the conversion would copy
+        the whole table into a device buffer twice - once for the table and
+        once for the gather - for a result that is usually far smaller than
+        the table it came from.
 
         Parameters
         ----------
@@ -979,9 +1031,9 @@ class Atmosphere:
             dtype=self.dtype,
             subset=subset,
         )
-        if subset is None:
-            return resampler.apply(table)
-        return resampler.apply(table[..., subset])
+        if subset is not None:
+            table = table[..., subset]
+        return physics.as_array(resampler.apply_numpy(table), dtype=self.dtype)
 
     def _build_opacities(self) -> None:
         """Load the cross-section tables and resample them once."""
@@ -1007,10 +1059,7 @@ class Atmosphere:
             subset = np.where(
                 (source >= self.wngrid.min()) & (source <= self.wngrid.max())
             )[0]
-            table = physics.as_array(
-                np.asarray(opacity.xsecGrid, dtype=get_float_dtype()),
-                dtype=self.dtype,
-            )
+            table = np.asarray(opacity.xsecGrid, dtype=get_float_dtype())
             self._interpolators[gas] = OpacityInterpolator(
                 self._resample_table(table, source, subset=subset),
                 physics.as_array(
@@ -1078,10 +1127,7 @@ class Atmosphere:
         for pair_name in contribution.ciaPairs:
             cia = cache[pair_name]
             source = np.asarray(cia.wavenumberGrid, dtype=get_float_dtype())
-            table = physics.as_array(
-                np.asarray(cia._xsec_grid, dtype=get_float_dtype()),
-                dtype=self.dtype,
-            )
+            table = np.asarray(cia._xsec_grid, dtype=get_float_dtype())
             terms.append(
                 (
                     cia.pairOne,

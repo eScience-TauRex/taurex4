@@ -122,6 +122,7 @@ class PyMieScattGridExtinctionContribution(Contribution):
     in microns, a ``wavenumber_grid`` dataset in :math:`cm^{-1}`, and either a
     ``Qext`` or ``Qext_grid`` dataset containing extinction efficiencies.
     """
+
     # The kernel below integrates the cross-section against the path length
     # alone and takes no density at all.
     density_power = 0

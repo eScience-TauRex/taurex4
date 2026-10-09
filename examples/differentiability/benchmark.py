@@ -19,9 +19,9 @@ the part that reports the optimiser's own timings.
 
 import argparse
 import pickle  # noqa: S403
-from functools import partial
 import tempfile
 import time
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -57,9 +57,9 @@ def cross_sections(centre, width):
     temperature = TEMPERATURE_GRID[None, :, None]
     pressure = PRESSURE_GRID[:, None, None]
     wavenumber = WAVENUMBER_GRID[None, None, :]
-    band = np.exp(-((wavenumber - centre) / width) ** 2)
-    return (1e-18 * band + 1e-22) * (1.0 + 3000.0 / temperature) * (
-        1.0 + 1e-6 * pressure
+    band = np.exp(-(((wavenumber - centre) / width) ** 2))
+    return (
+        (1e-18 * band + 1e-22) * (1.0 + 3000.0 / temperature) * (1.0 + 1e-6 * pressure)
     )
 
 
@@ -74,7 +74,9 @@ def write_tables(tmp_path):
     """
     import h5py
 
-    from taurex.cache import CIACache, GlobalCache, OpacityCache
+    from taurex.cache import CIACache
+    from taurex.cache import GlobalCache
+    from taurex.cache import OpacityCache
 
     tables = (
         ("H2O", "1H2-16O", 6800.0, 250.0),
@@ -91,10 +93,13 @@ def write_tables(tmp_path):
             handle.create_dataset("xsecarr", data=cross_sections(centre, width))
             handle.create_dataset("mol_name", data=np.array([molecule.encode()]))
 
-    cia_table = np.outer(
-        1.0 + 200.0 / TEMPERATURE_GRID,
-        np.exp(-((WAVENUMBER_GRID - 7500.0) / 600.0) ** 2),
-    ) * 1e-40
+    cia_table = (
+        np.outer(
+            1.0 + 200.0 / TEMPERATURE_GRID,
+            np.exp(-(((WAVENUMBER_GRID - 7500.0) / 600.0) ** 2)),
+        )
+        * 1e-40
+    )
     with open(tmp_path / "H2-H2.db", "wb") as handle:
         pickle.dump(
             {
@@ -128,14 +133,13 @@ def build_model(observation):
         A built model with absorption, Rayleigh, CIA and a flat cloud deck
 
     """
-    from taurex.contributions import (
-        AbsorptionContribution,
-        CIAContribution,
-        FlatMieContribution,
-        RayleighContribution,
-    )
+    from taurex.contributions import AbsorptionContribution
+    from taurex.contributions import CIAContribution
+    from taurex.contributions import FlatMieContribution
+    from taurex.contributions import RayleighContribution
     from taurex.data import Planet
-    from taurex.data.profiles.chemistry import ConstantGas, TaurexChemistry
+    from taurex.data.profiles.chemistry import ConstantGas
+    from taurex.data.profiles.chemistry import TaurexChemistry
     from taurex.data.profiles.pressure import SimplePressureProfile
     from taurex.data.profiles.temperature import Isothermal
     from taurex.data.stellar import BlackbodyStar

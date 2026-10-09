@@ -7,12 +7,12 @@ a retrieval that follows its gradient instead of sampling the posterior blind.
 
 `src/taurex/differentiability/`
 
-| file | contents |
-| --- | --- |
-| `physics.py` | torch ports of the hydrostatic profile, the path-length matrix, the opacity interpolation and the boxcar smoothing |
-| `model.py` | `Atmosphere`: the differentiable transmission model, the contribution plans, a linear binning operator and the log likelihood |
-| `optimizer.py` | `LaplaceOptimizer`: a maximum a posteriori fit followed by a Laplace approximation of the posterior |
-| `__init__.py` | exports, and the module the plugin entry point points at |
+| file           | contents                                                                                                                      |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `physics.py`   | torch ports of the hydrostatic profile, the path-length matrix, the opacity interpolation and the boxcar smoothing            |
+| `model.py`     | `Atmosphere`: the differentiable transmission model, the contribution plans, a linear binning operator and the log likelihood |
+| `optimizer.py` | `LaplaceOptimizer`: a maximum a posteriori fit followed by a Laplace approximation of the posterior                           |
+| `__init__.py`  | exports, and the module the plugin entry point points at                                                                      |
 
 The numpy model is untouched and remains the reference implementation. The
 torch code reads the same object graph the input file builds, so profiles,
@@ -45,9 +45,9 @@ optimizers use.
 
 ## How the optimizer works
 
-Nested sampling has no gradient to follow, so it has to *explore* the posterior
+Nested sampling has no gradient to follow, so it has to _explore_ the posterior
 and burn thousands of likelihood evaluations doing it. A differentiable model
-lets the fit *locate* the posterior instead: follow the gradient to the mode,
+lets the fit _locate_ the posterior instead: follow the gradient to the mode,
 then describe the shape around it. `LaplaceOptimizer` does exactly that, in five
 steps.
 
@@ -68,8 +68,8 @@ parameter by the inverse cumulative distribution of that parameter's own prior,
 which is the same map `Optimizer.prior_transform` uses in the sampling
 optimizers.
 
-This means the bounds and priors from the input file are respected *by
-construction*. No penalty terms, no clipping, no rejected proposals: every point
+This means the bounds and priors from the input file are respected _by
+construction_. No penalty terms, no clipping, no rejected proposals: every point
 the optimizer visits is a physically allowed one, and a parameter can never
 wander outside its bounds. For a `log` mode parameter the fit space is already
 `log10`, so a `LogUniform` bound simply becomes a flat interval in that space.
@@ -112,7 +112,7 @@ mode is roughly Gaussian with covariance `H^-1`. The Hessian is taken in `u`
 rather than in parameter space because `u` is well conditioned — the sigmoid
 saturation that makes parameters awkward is exactly what keeps `u` of order one
 — and the result is then pushed back to parameter space with the Jacobian of the
-transformation, so the reported covariance is the covariance of the *parameters*.
+transformation, so the reported covariance is the covariance of the _parameters_.
 
 Retrieval Hessians are numerically nasty: they routinely span many orders of
 magnitude across their eigenvalues, and the near-null directions are what make a
@@ -131,7 +131,7 @@ curvature sit orders of magnitude above the ridge and are untouched.
 ### 5. Samples, medians and error bars come from that Gaussian
 
 `num_samples` draws are taken in `u` space from the fitted Gaussian and pushed
-through the *same* prior transform, so every sample lands inside the prior
+through the _same_ prior transform, so every sample lands inside the prior
 support however wide the Gaussian is. The samples carry equal weight, because
 they are already draws from the posterior rather than links of a correlated
 chain — which is also why `sigma_fraction` can be set far lower here than for a
@@ -143,16 +143,16 @@ post-processing.
 
 ### Options
 
-| option | default | meaning |
-| --- | --- | --- |
-| `num_samples` | 2000 | posterior draws taken from the Gaussian |
-| `max_iterations` | 200 | maximum L-BFGS steps |
-| `max_lbfgs_iterations` | 40 | line search evaluations allowed per step |
-| `gradient_tolerance` | 1e-10 | convergence tolerance on the gradient norm |
-| `eigenvalue_floor` | 1e-3 | ridge on the scaled Hessian; larger values widen the error bars of unconstrained parameters |
-| `seed` | 0 | seed for the draws, so a run is reproducible |
-| `device` | cpu | torch device |
-| `sigma_fraction` | 0.02 | fraction of the draws reused for the profile bands |
+| option                 | default | meaning                                                                                     |
+| ---------------------- | ------- | ------------------------------------------------------------------------------------------- |
+| `num_samples`          | 2000    | posterior draws taken from the Gaussian                                                     |
+| `max_iterations`       | 200     | maximum L-BFGS steps                                                                        |
+| `max_lbfgs_iterations` | 40      | line search evaluations allowed per step                                                    |
+| `gradient_tolerance`   | 1e-10   | convergence tolerance on the gradient norm                                                  |
+| `eigenvalue_floor`     | 1e-3    | ridge on the scaled Hessian; larger values widen the error bars of unconstrained parameters |
+| `seed`                 | 0       | seed for the draws, so a run is reproducible                                                |
+| `device`               | cpu     | torch device                                                                                |
+| `sigma_fraction`       | 0.02    | fraction of the draws reused for the profile bands                                          |
 
 ### What it gives up
 
@@ -169,11 +169,11 @@ optimizer.
 The torch model is not an approximation of the numpy one. On the example
 retrieval (80 layers, 4669 native points, 488 observation bins):
 
-| quantity | agreement with the numpy model |
-| --- | --- |
-| transit depth | `6.6e-16` maximum relative difference |
-| binned spectrum | `8.8e-16` maximum relative difference |
-| log likelihood | `-93014.79951309151` against numpy `-93014.79951309128` |
+| quantity        | agreement with the numpy model                          |
+| --------------- | ------------------------------------------------------- |
+| transit depth   | `6.6e-16` maximum relative difference                   |
+| binned spectrum | `8.8e-16` maximum relative difference                   |
+| log likelihood  | `-93014.79951309151` against numpy `-93014.79951309128` |
 
 Autograd gradients of the chi-squared match central finite differences to `1e-8`
 or better, so the optimizer is following the derivative of the same quantity the
@@ -189,10 +189,10 @@ pre-existing tests still pass.
 
 Single evaluation of the example model:
 
-| | time |
-| --- | --- |
-| numpy forward | 40 ms |
-| torch forward | 36 ms |
+|                          | time  |
+| ------------------------ | ----- |
+| numpy forward            | 40 ms |
+| torch forward            | 36 ms |
 | torch forward + backward | 60 ms |
 
 The per-evaluation cost is comparable; the gain is that the gradient comes almost
@@ -201,10 +201,10 @@ needs `2n` forwards — eight for the four-parameter example.
 
 Whole fit, four parameters, MAP plus 2000 posterior samples:
 
-| | |
-| --- | --- |
-| numpy forwards that fit is worth | 36 |
-| wall clock | 1.4 s |
+|                                  |       |
+| -------------------------------- | ----- |
+| numpy forwards that fit is worth | 36    |
+| wall clock                       | 1.4 s |
 
 Nested sampling at 302 live points needs of order `10^4` to `10^5` evaluations
 for the same problem, which at 40 ms each is 40 minutes to several hours, so the

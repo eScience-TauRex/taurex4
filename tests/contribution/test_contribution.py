@@ -312,9 +312,7 @@ def test_accumulate_path_matrix_keeps_custom_contribute():
     model.add_contribution(standard)
     model.add_contribution(custom)
 
-    expected = (
-        matrix @ (standard.sigma_xsec * density[:, None]) + custom.sigma_xsec
-    )
+    expected = matrix @ (standard.sigma_xsec * density[:, None]) + custom.sigma_xsec
 
     tau = model.accumulate_path_matrix(wngrid, matrix, density)
 

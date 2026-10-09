@@ -124,6 +124,64 @@ outside it, leaving the original numpy path for everything else:
   `compile_time` / `fit_time` / `laplace_time` / `iterations` /
   `function_evaluations` / `gradient_evaluations` counters.
 
+### Memory hardening of the differentiable path
+
+Two allocations inside the JAX package itself dominate a fit's peak, and both
+are avoidable:
+
+- **Posterior draws.** `generate_profiles` fed every draw to one
+  `jax.vmap`-ed forward pass. A forward pass keeps several
+  `(nlayers, nwn)` arrays live, so vmapping them turns those into
+  `(ndraws, nlayers, nwn)`: the default two thousand draws of an eighty layer
+  atmosphere cost gigabytes to produce four small variance vectors. The draws
+  are now evaluated with `jax.lax.map` at a batch size derived from the model
+  and a fixed byte budget, so only one batch is resident, and the loop stays
+  _inside_ the compiled program so nothing is dispatched per batch.
+- **Table resampling.** The opacity and CIA tables were converted to device
+  arrays in full and then reduced onto the working grid, so a table with a
+  hundred thousand wavenumber points was copied over twice to produce a much
+  smaller one. The interpolation is now done on the host array and only the
+  resampled result is handed to JAX, which also removes the eager dispatch (and
+  the mini-compilations it triggered) from `Atmosphere.__init__`.
+
+Two further things a campaign should know, neither of them a code change:
+
+- compilation is the single largest cost of a fit — in the measurements below
+  it is over half the total — and it is paid per `compute_fit` call. Setting
+  `JAX_COMPILATION_CACHE_DIR` lets JAX persist and reuse it across processes,
+  which roughly halves the compile time of a repeat run of the same input;
+- the numpy opacity tables stay in `OpacityCache` for the whole fit even though
+  the differentiable model only reads its own resampled copies. At high
+  resolution that is the bulk of the resident memory, and releasing it during a
+  fit would mean reloading it for the numpy model afterwards.
+
+### Memory hardening of the shared numpy path
+
+The JAX package is additive, but the numpy code it shares with the original
+carries a set of memory fixes ported from the TauREx3 out-of-memory work
+(`issue120_oom_2`), because the two allocation spikes reported in
+[ucl-exoplanets/taurex3#120](https://github.com/ucl-exoplanets/taurex3/issues/120)
+sit outside the differentiable model:
+
+- before a retrieval starts, `taurex.main()` warmed up on the _full_ native
+  grid instead of the grid the retrieval actually uses;
+- during post-processing, `store_contributions` modelled every contribution at
+  once, so all of their cross-sections were live simultaneously.
+
+`SimpleForwardModel._last_wngrid` records the grid of the most recent
+evaluation, `write()` and `store_contributions` reuse it, `taurex.main()`
+warms up on the observed grid and releases that working set with
+`trim_memory()` before the fit. The remaining fixes remove broadcast
+temporaries (the transmission integral, `FlatMie`), stream `h5py` datasets
+into MPI shared memory in bounded chunks instead of materialising a private
+copy on the root rank, and avoid needless copies when writing HDF5 and
+checking the opacity grid.
+
+One observable consequence: `Output/Spectra/native_*` and the per-contribution
+`native_*` arrays are now written on the clipped grid of the last evaluation
+rather than on the full native grid, so an observed-grid run stores fewer
+native points than before. `binned_*` output is unaffected.
+
 ### Compatibility
 
 - Input files, fitting parameters, priors, bounds and the HDF5 layout are
@@ -508,6 +566,25 @@ a traced argument, but the optimizer's objective still captures the observation
 and the model, so a campaign that reuses one model — a grid of planets, a
 sequence of injections — would still want that hoisting, and it is the obvious
 next optimisation if the compile cost starts to matter.
+
+### Peak memory
+
+Measured separately, on the local `reference_runs` input (80 layers, a 426 point
+clipped grid, two absorbing gases, three CIA-free Rayleigh/CIA/flat-cloud
+contributions, 2000 posterior draws), peak RSS of the process:
+
+| phase                                           | before   | after    |
+| ----------------------------------------------- | -------- | -------- |
+| Post-processing the draws (`generate_profiles`) | +2.73 GB | +0.03 GB |
+| Resampling one 320 MB table                     | +0.61 GB | +0.01 GB |
+| Whole `taurex -R` retrieval                     | 3.45 GB  | 0.81 GB  |
+
+The last row is the end-to-end effect: 4.3 x less peak, for the same wall clock
+(37.7 s against 37.0 s). Both allocation spikes scale with the size of the
+atmosphere rather than being fixed overhead — the vmapped draws with
+`nlayers x nwn`, the table copies with the number of wavenumber points in the
+opacity file — so the gap widens at high resolution, which is where the OOM
+reports came from.
 
 These numbers are single measurements on a laptop and move by ten or twenty per
 cent between runs, so treat the ratios as the result and the absolute values as
