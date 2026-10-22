@@ -108,7 +108,7 @@ outside it, leaving the original numpy path for everything else:
 
 - temperature: `Isothermal` and `NPoint`;
 - chemistry: `TaurexChemistry` with `ConstantGas` gases;
-- contributions: `Absorption`, `Rayleigh`, `CIA` and `FlatMie`;
+- contributions: `Absorption`, `Rayleigh`, `CIA`, `FlatMie` and `LeeMie`;
 - opacities: cross-section (`xsec`) tables only, not `ktables`;
 - binning: `FluxBinner` and `NativeBinner`.
 
@@ -191,6 +191,93 @@ native points than before. `binned_*` output is unaffected.
   evidence value and, with `sampler = nuts`, a covariance that is the sample
   covariance rather than the Laplace one.
 
+### What TauREx3 `main` has gained since this branch was cut
+
+`main` of [`ucl-exoplanets/TauREx3`](https://github.com/ucl-exoplanets/TauREx3)
+moved on while this branch was being written. Nothing it gained touches
+`src/taurex/differentiability/`, but one change reaches the two objects the
+differentiable model reads, the observation and the binner. The commits, most
+recent first:
+
+| commit               | content                                                                                                                                                                                                                                      | reaches the differentiable path          |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
+| `21651ec`            | instrument-systematics plugin incorporated ([#122](https://github.com/ucl-exoplanets/taurex3/pull/122)), 24 files, `+2234/-57`                                                                                                               | yes: two observation classes, one binner |
+| `34b7253`            | `OptimizerMixin` no longer shadows `Optimizer.fitting_parameters` ([#175](https://github.com/ucl-exoplanets/taurex3/pull/175))                                                                                                               | no                                       |
+| `bb3e6b6`            | blank lines ([#176](https://github.com/ucl-exoplanets/taurex3/pull/176))                                                                                                                                                                     | no                                       |
+| `04a587d`            | out-of-memory fixes for HST ([#186](https://github.com/ucl-exoplanets/taurex3/pull/186)): one cross-section scratch buffer per evaluation, contributions modelled one at a time, `_last_wngrid`, `h5py` datasets streamed into shared memory | no: this branch already carries them     |
+| `03da61c`, `b354112` | astropy `Quantity` accepted at the inputs ([#159](https://github.com/ucl-exoplanets/taurex3/pull/159), [#160](https://github.com/ucl-exoplanets/taurex3/pull/160))                                                                           | no: the port reads the converted arrays  |
+
+The `04a587d` row is worth stating explicitly: `src/taurex/model/simplemodel.py`,
+`src/taurex/mpi.py`, `src/taurex/opacity/` and `src/taurex/util/output.py` are
+identical to `main`, so the memory fixes described above as ported from
+`issue120_oom_2` are the ones that landed upstream as `04a587d`. The numpy
+files that still differ from `main` are `transmission.py` (this branch carries
+a rectangular path-matrix helper that `main` does not) and the contributions.
+
+**The instrument systematics, now in the main package.** `21651ec` adds two
+observation loaders and one binner:
+
+| piece               | module                                   | selected with                                                        | what it adds                                                                                                   |
+| ------------------- | ---------------------------------------- | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `OffsetSpectra`     | `taurex/data/spectrum/offsetspectrum.py` | `observation = spectra_w_offsets` (or `observation_w_offsets`)       | several ASCII spectra stacked into one observation, with a fittable offset, slope and error scale per spectrum |
+| `OffsetSpectraCont` | same                                     | `observation = spectra_instr` (or `observation_instr`)               | the same, plus a response function per spectrum selected through `path_broadening`                             |
+| `FluxBinnerConv`    | `taurex/binning/fluxbinnerconv.py`       | `[Binning] bin_type = observed`, or the binner of either observation | bins a native spectrum onto several instrument grids and convolves each with its own profile before binning    |
+
+Details a fit meets:
+
+- the systematics are fitting parameters on the observation object, so they
+  appear under `[Fitting]` like any model parameter: `Offset_i`, `Slope_i` and
+  `Escale_i` with bounds `(-0.001, 0.001)`, `WLShift_i` with bounds twice the
+  median bin width in microns, and `Broadening_i_k` when `broadening_order` is
+  set, with bounds `(-0.35, 0.35)` for a calibrated profile and
+  `(log 50, log 1e5)` for a functional one;
+- the response handling moved from the model to the binner: `broadening_type`,
+  `broadening_profiles` and `wlshift` are `[Binning]` keys now, and
+  `observation = spectra_instr` is a backwards-compatible alias for them;
+- `BaseSpectrum.create_binner` gained `**kwargs`, `Optimizer` gained
+  `set_binner`, and `taurex.main()` builds the binner with the observation, so
+  that the binner knows which spectra it is binning;
+- `InstrumentFile` takes an explicit binner and `SNR.model_noise` bins with the
+  binner it is handed rather than the model's default;
+- one notebook, `examples/notebooks/12_instruments.ipynb`, and the matching
+  user documentation.
+
+**What it means here.** The Laplace fit is built on three arrays it treats as
+constants: the observed spectrum, its errors, and one linear binning matrix of
+the shape a `FluxBinner` produces.
+
+- An `OffsetSpectra` or `OffsetSpectraCont` observation is **refused, not
+  fitted**. `Atmosphere._build_observation` accepts `FluxBinner` and
+  `NativeBinner` only, `_OffsetSpectrumBase.create_binner()` returns a
+  `FluxBinnerConv`, and the model raises
+  `NotImplementedError: The differentiable model can only bin with FluxBinner, NativeBinner, got FluxBinnerConv`.
+  An input file with `observation = spectra_w_offsets` or `spectra_instr`
+  therefore runs on the numpy samplers and stops on `optimizer = laplace`, with
+  that message. That is the documented behaviour of the port — raise outside
+  its subset — and it is the first thing a user of both will meet.
+- It cannot be lifted by adding `FluxBinnerConv` to the accepted tuple. The
+  three arrays are constant only because the operator does not move; here it
+  does. `OffsetSpectra.wavelengthGrid` is shifted by the fitted `WLShift_i`,
+  `FluxBinnerConv.sigma` is a function of the fitted `Broadening_i_k`, and
+  `Offset_i`, `Slope_i` and `Escale_i` rescale the data and its errors spectrum
+  by spectrum. A differentiable version has to rebuild the convolution kernel
+  and re-shift the grid inside the traced program whenever one of those
+  parameters moves, which makes the likelihood a function of a
+  wavelength-dependent convolution rather than of a fixed matrix. That is a
+  different forward model, not a missing branch, and it is not implemented.
+- `FluxBinnerConv` also bins each spectrum onto its own native grid before
+  convolving, so the "native" grid stops being one grid: `Atmosphere` closes
+  over a single `self.wngrid` and one opacity resampling onto it.
+- `Optimizer.set_binner` is not honoured. `Atmosphere` builds its own operator
+  from `observed.create_binner()`, so once `main` is merged an input file that
+  sets a binner explicitly gets that binner in the sampling optimizers and the
+  observation's own binner here. The two paths disagree silently; either the
+  override has to be wired through or it has to be refused.
+- Nothing else reaches this package. The instrument models are noise models,
+  not part of the forward pass; the astropy-unit handling converts the inputs
+  before the model is built; `34b7253` fixes the mixin's parameter properties,
+  which `LaplaceOptimizer` does not inherit through.
+
 ## Usage
 
 The input file does not change at all:
@@ -231,6 +318,25 @@ values and then slice. A slice needs python integers, which a traced cloud top
 is not, so the window is built with traced `searchsorted` bounds and applied
 with `jnp.where`. That is what lets a fitted cloud deck keep its gradient _and_
 stay inside the compiled program.
+
+**The LeeMie deck replaces its boolean pressure mask with two sigmoids.** The
+numpy contribution multiplies the cross-section by
+`(pressure <= bottom) & (pressure >= top)`, which is constant almost everywhere
+and has no derivative with respect to either boundary. The mask is the product
+of `sigmoid((log P - log top) / w)` and `sigmoid((log bottom - log P) / w)`
+instead, with `w = 0.25` times one layer of the `log10 P` grid
+(`LeeMiePlan.width_in_layers`). For a boundary that falls midway between two
+layer centres the layer inside gets 0.88 of the cross-section and the layer
+outside 0.12, so the pair carries the column the step function selects, and the
+deviation one layer further in is 2.5e-3. A boundary the input leaves at `-1`
+contributes a factor of exactly one, so an open deck reproduces the numpy
+optical depth to machine precision. A deck between two pressures moves about a
+percent of the optical depth between the two layers that straddle each
+boundary, and the resulting spectrum agrees with the numpy model to 1e-4
+relative. The Lee cross-section itself is evaluated on the wavenumber axis only
+(`x = 2 pi a / lambda`) and broadcast over the layers, so the size parameter and
+its exponents are computed `nwavenumber` times rather than
+`nlayers * nwavenumber` times.
 
 **The isothermal shortcut in the temperature profile is a `where`.** The numpy
 profile branches on the values of the nodes, which is fine for concrete arrays
@@ -594,6 +700,118 @@ forward or backward pass. The optimizer reports what it cost, so a real
 comparison does not need a profiler: `compile_time`, `fit_time`, `laplace_time`,
 `iterations`, `function_evaluations` and `gradient_evaluations` are attributes
 of the optimizer after `compute_fit`.
+
+### Where the time goes, and what was made cheaper
+
+The same workload as above, re-measured on the same machine (6 core
+`i7-10750H`, `jax` 0.11.2, CPU), with the cost analysis XLA reports for each
+compiled program:
+
+| program              | time       | flops | bytes moved |
+| -------------------- | ---------- | ----- | ----------- |
+| forward              | 3.4-3.7 ms | 7.7e7 | 3.7e7       |
+| forward and backward | 21-23 ms   | 2.3e8 | 3.4e8       |
+| Hessian              | 101-126 ms | 1.9e9 | 1.5e9       |
+| `profile_state`      | 2.6 ms     | 7.2e7 | 2.0e7       |
+
+The gradient moves 9.2 times the bytes of the forward pass and 3.0 times its
+flops, which is ordinary reverse-mode behaviour over a chain of elementwise
+operations on `(nlayers, nwn)` arrays, and it runs at about 15 GB/s, which is
+what this machine sustains. The levers are therefore bytes and dispatches, not
+arithmetic. Two changes came out of that.
+
+**One opacity interpolation instead of five.** The numpy code takes a six
+branch cascade past the edge of the table — both axes at the maximum, both at
+the minimum, then one axis at a time — and the port evaluated all four
+single-axis branches and selected with `where`, so four extra
+`(nlayers, nwn)` interpolations were computed and then discarded on every
+evaluation, in the forward pass and again in the backward pass. Pinning both
+bracketing indices of an axis to one entry makes that axis' interpolation
+weight vanish, which reproduces each branch exactly, so the four cases collapse
+into one interpolation with clamped indices. The clamping follows the order of
+the numpy cascade, so a layer out of range on both axes keeps the extrapolation
+on the other axis that the cascade performs.
+
+| quantity                                     | before             | after              |
+| -------------------------------------------- | ------------------ | ------------------ |
+| interpolator forward, one gas                | 0.156 ms           | 0.120 ms           |
+| interpolator forward flops, one gas          | 1.12e7             | 5.24e6             |
+| interpolator backward wrt temperature        | 4.50 ms            | 1.49 ms            |
+| gradient of the model, bytes                 | 4.03e8             | 3.43e8             |
+| gradient of the model, paired runs           | 24.4, 26.5 ms      | 23.5, 22.9 ms      |
+| Hessian, the same paired runs                | 126, 140 ms        | 120, 126 ms        |
+| compile time of forward / gradient / Hessian | 0.69, 1.06, 2.08 s | 0.82, 1.13, 2.16 s |
+
+Each pair is two consecutive runs with the two versions of the interpolation
+swapped in at run time, so that the machine load cancels. The compile time is
+unchanged within the spread of the machine: three consecutive compilations
+after the change took `0.79`, `0.81` and `0.79 s` for the forward, `1.09`,
+`1.10` and `1.09 s` for the gradient and `2.16`, `2.16` and `2.15 s` for the
+Hessian. The cascade is also
+where the port differed from numpy: the two "both axes out of range" cases were
+overridden by the single-axis `where`s that followed them, so a layer beyond the
+temperature and the pressure maximum took the temperature interpolation of the
+last pressure row instead of the grid corner. The clamped version applies them
+last, in the order of the numpy `if`/`elif` chain. Native spectra now agree with
+the numpy model to `2.2e-16` at 2000 K and `2.0e-16` at 200 K, above and below
+the 300-1500 K table, as well as to `2.8e-16` at 800 K inside it.
+
+**The Laplace block runs on the host.** Everything after the Hessian is linear
+algebra on matrices of `nparams` by `nparams` and on the draws themselves, and
+three things in it were being paid for at the cost of a device program each.
+`jax.random.normal` outside a compiled function compiles the whole bit
+generator chain for a two-thousand by four array; the scaling, the ridge, the
+inversion and the parameter covariance were dispatched one operation at a time;
+and `float(-objective(u_map))` re-ran the entire atmosphere eagerly to recover a
+number the compiled fit had already returned as its fifth output. The draws are
+now made with `numpy.random`, the linear algebra is numpy, and the posterior
+value the fit reports at the point it keeps is the one used.
+
+| Laplace block                | before | after   |
+| ---------------------------- | ------ | ------- |
+| 2000 draws (`_draw_samples`) | 1.10 s | 0.011 s |
+| `laplace_time`, whole block  | 1.32 s | 0.15 s  |
+
+Of the remaining 0.15 s, 0.10 s is the Hessian itself and 0.05 s the host linear
+algebra around it.
+
+**End to end**, the same benchmark retrieval (80 layers, 4395 native points,
+488 bins, four parameters, 200 optimiser steps):
+
+| phase             | before  | after       |
+| ----------------- | ------- | ----------- |
+| trace and compile | 6.15 s  | 6.2-7.0 s   |
+| optimiser         | 6.34 s  | 5.8-6.2 s   |
+| Laplace           | 1.32 s  | 0.15 s      |
+| total             | 14.49 s | 13.0-13.6 s |
+
+Three things were tried and measured and are recorded here so that they are not
+tried again:
+
+- **Rematerialisation of the forward pass** to cut the activation traffic:
+  `22.2 ms` with `jax.checkpoint`, `25.9 ms` with
+  `dots_with_no_batch_dims_saveable`, against `21.5 ms` without. XLA already
+  fuses the forward chain tightly enough that recomputing it costs more than
+  holding it.
+- **A sparse binning operator.** The `(nbins, nwn)` overlap matrix is 17.2 MB
+  for 7949 non-zeros, so a `segment_sum` over the non-zeros moves 57 times fewer
+  bytes. It is slower: `0.95 ms` against `0.38 ms` for the dense `BLAS` product,
+  because the scatter is serial on the CPU and the matrix product is not.
+- **Stopping the fit early on the objective.** The fit spends its last hundred
+  steps changing the posterior by about `1e-13` of itself per step or less, and
+  the gradient norm wanders between `1e-7` and `1e-3` without ever reaching the
+  `1e-10` tolerance. A stall test cannot separate that tail from a genuine
+  plateau earlier in the fit: at a threshold of `1e-9` relative the fit stops
+  after 37 steps, at a chi-squared of `0.63` instead of `1.6e-8`, because the
+  parametrisation has stretches where the objective moves by `1e-11` of itself
+  for several steps and then descends again. At `1e-14` the test fires at
+  iteration 196 of 200 and buys nothing.
+
+What is left is the compile phase, which is now about half of a fit: of the
+6.2 s, 1.70 s is the XLA compilation of the optimiser program, 1.06 s the
+Hessian and 0.39 s the log-likelihood program, and the remaining 3 s is tracing
+those programs. It is paid once per `compute_fit`, so
+`JAX_COMPILATION_CACHE_DIR` remains the way to remove it from a campaign.
 
 ## Reproducing and comparing
 

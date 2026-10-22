@@ -14,8 +14,11 @@ import pytest
 
 from taurex.differentiability import Atmosphere
 
+from .conftest import add_leemie_deck
 from .conftest import build_model
+from .conftest import build_thin_model
 from .conftest import compile_fit_params
+from .conftest import layer_midpoints
 
 
 jax = pytest.importorskip("jax")
@@ -193,12 +196,101 @@ def test_chi_squared_is_zero_for_a_perfect_fit(data_path, taurex_model, observat
     assert float(value) < 1e-20
 
 
+@pytest.mark.parametrize("windowed", [False, True])
+def test_leemie_matches_numpy_model(data_path, observation, windowed):
+    """The plan reproduces the numpy LeeMie contribution.
+
+    With both boundaries unset the numpy mask is the whole column and the
+    optical depth agrees exactly. A deck between two pressures has its edge
+    layers split by the sigmoid, which moves a percent of the optical depth
+    between adjacent layers; the depth the two models produce still agrees to
+    1e-4 relative.
+    """
+    model = build_thin_model()
+    if windowed:
+        bottom, top = layer_midpoints(model)
+    else:
+        bottom = top = -1.0
+    add_leemie_deck(model, bottom, top)
+
+    atmosphere = Atmosphere(model, observation, fit_params=[])
+    theta = jnp.zeros(0, dtype=jnp.float64)
+    depth, tau, _ = atmosphere.forward(theta)
+
+    _, expected_depth, expected_tau, _ = model.model(wngrid=observation.wavenumberGrid)
+
+    if windowed:
+        np.testing.assert_allclose(np.asarray(depth), expected_depth, rtol=1e-3)
+    else:
+        np.testing.assert_allclose(
+            np.asarray(tau), -np.log(np.asarray(expected_tau)), rtol=1e-10
+        )
+
+
+def test_leemie_boundary_has_a_gradient(data_path, observation):
+    """A fitted cloud top and particle radius move the spectrum.
+
+    The numpy contribution selects layers with a boolean mask, which has no
+    derivative; the sigmoid window is what gives the two boundaries a
+    gradient. The finite difference checks that the gradient is the derivative
+    of that same chi-squared.
+    """
+    model = build_thin_model()
+    bottom, top = layer_midpoints(model)
+    add_leemie_deck(model, bottom, top)
+
+    names = ("lee_mie_topP", "lee_mie_radius")
+    fit_params = compile_fit_params(model, observation, names)
+    atmosphere = Atmosphere(model, observation, fit_params=fit_params)
+
+    start = np.array([np.log10(top), 0.05])
+    point = jnp.asarray(start, dtype=jnp.float64)
+    analytic = np.asarray(jax.grad(atmosphere.chi_squared)(point)).copy()
+
+    steps = np.array([1e-3, 1e-5])
+    numeric = np.zeros_like(analytic)
+    for index in range(start.shape[0]):
+        offset = np.zeros_like(start)
+        offset[index] = steps[index]
+        plus = jnp.asarray(start + offset, dtype=jnp.float64)
+        minus = jnp.asarray(start - offset, dtype=jnp.float64)
+        numeric[index] = float(
+            atmosphere.chi_squared(plus) - atmosphere.chi_squared(minus)
+        ) / (2.0 * steps[index])
+
+    assert np.all(np.abs(analytic) > 0.0)
+    # The chi-squared is of order 1e7 here, so the central difference itself is
+    # only good to about 1e-5 relative.
+    np.testing.assert_allclose(analytic, numeric, rtol=1e-4)
+
+
+def test_leemie_forward_pass_compiles(data_path, observation):
+    """A LeeMie deck with fitted boundaries traces, compiles and differentiates."""
+    model = build_thin_model()
+    bottom, top = layer_midpoints(model)
+    add_leemie_deck(model, bottom, top)
+
+    names = ("lee_mie_bottomP", "lee_mie_topP", "lee_mie_radius")
+    fit_params = compile_fit_params(model, observation, names)
+    atmosphere = Atmosphere(model, observation, fit_params=fit_params)
+    point = jnp.array([np.log10(bottom), np.log10(top), 0.05], dtype=jnp.float64)
+
+    gradient = jax.jit(jax.grad(atmosphere.chi_squared))
+    np.testing.assert_allclose(
+        np.asarray(gradient(point)),
+        np.asarray(jax.grad(atmosphere.chi_squared)(point)),
+        rtol=1e-12,
+    )
+    hessian = np.asarray(jax.jit(jax.hessian(atmosphere.chi_squared))(point))
+    assert np.all(np.isfinite(hessian))
+
+
 def test_unsupported_contribution_is_rejected(data_path, taurex_model, observation):
     """A contribution without a differentiable plan fails loudly."""
-    from taurex.contributions import LeeMieContribution
+    from taurex.contributions import SimpleCloudsContribution
 
-    taurex_model.add_contribution(LeeMieContribution())
-    with pytest.raises(NotImplementedError, match="LeeMie"):
+    taurex_model.add_contribution(SimpleCloudsContribution())
+    with pytest.raises(NotImplementedError, match="SimpleClouds"):
         Atmosphere(taurex_model, observation, fit_params=[])
 
 

@@ -98,7 +98,12 @@ def observation():
     return ArraySpectrum(np.vstack([wavelength, data, error, width]).T)
 
 
-def build_model(temperature_profile=None):
+def build_model(
+    temperature_profile=None,
+    h2o_mix_ratio=1e-4,
+    cia=True,
+    flat_mie=True,
+):
     """Build the small transmission model.
 
     The temperature profile has to be chosen before the model is built, because
@@ -109,6 +114,18 @@ def build_model(temperature_profile=None):
     ----------
     temperature_profile:
         Temperature profile to use, isothermal at 900 K by default
+
+    h2o_mix_ratio:
+        Mixing ratio of the absorbing gas. The synthetic cross-sections make
+        the default model optically thick everywhere; a test that needs a
+        transmission it can invert has to lower it.
+
+    cia:
+        Whether to add collision induced absorption, which dominates the
+        optical depth of the default model
+
+    flat_mie:
+        Whether to add the flat cloud deck
 
     Returns
     -------
@@ -129,7 +146,7 @@ def build_model(temperature_profile=None):
     from taurex.model import TransmissionModel
 
     chemistry = TaurexChemistry(fill_gases=["H2", "He"], ratio=0.172)
-    chemistry.addGas(ConstantGas("H2O", mix_ratio=1e-4))
+    chemistry.addGas(ConstantGas("H2O", mix_ratio=h2o_mix_ratio))
 
     if temperature_profile is None:
         temperature_profile = Isothermal(T=900.0)
@@ -145,10 +162,12 @@ def build_model(temperature_profile=None):
     )
     model.add_contribution(AbsorptionContribution())
     model.add_contribution(RayleighContribution())
-    model.add_contribution(CIAContribution(cia_pairs=["H2-H2"]))
-    model.add_contribution(
-        FlatMieContribution(flat_mix_ratio=1e-24, flat_topP=1e2, flat_bottomP=-1)
-    )
+    if cia:
+        model.add_contribution(CIAContribution(cia_pairs=["H2-H2"]))
+    if flat_mie:
+        model.add_contribution(
+            FlatMieContribution(flat_mix_ratio=1e-24, flat_topP=1e2, flat_bottomP=-1)
+        )
     model.model()
     return model
 
@@ -157,6 +176,73 @@ def build_model(temperature_profile=None):
 def taurex_model(data_path, observation):
     """A small transmission model using the synthetic opacities."""
     return build_model()
+
+
+def build_thin_model():
+    """A model whose transmission is not saturated by the synthetic tables.
+
+    The default fixtures are optically thick at every layer (tau of order 1e18),
+    so exp(-tau) underflows and a cloud deck could be added or removed without
+    changing the spectrum. Dropping the CIA term and the absorbing gas leaves a
+    transmission that the cloud actually moves.
+    """
+    return build_model(h2o_mix_ratio=1e-30, cia=False, flat_mie=False)
+
+
+def layer_midpoints(model):
+    """Two pressures, each midway between consecutive layer centres.
+
+    A boundary that sits on a layer centre is exactly where a soft window and a
+    step function disagree. Midway between two centres each sigmoid splits one
+    pair of layers, and the symmetric pair carries the column the step function
+    selects.
+
+    Parameters
+    ----------
+    model:
+        The model the pressures are read from
+
+    Returns
+    -------
+    bottom, top:
+        The two boundary pressures in Pa
+
+    """
+    centres = np.log10(np.asarray(model.pressureProfile))
+    return 10.0 ** (0.5 * (centres[3] + centres[4])), 10.0 ** (
+        0.5 * (centres[18] + centres[19])
+    )
+
+
+def add_leemie_deck(model, bottom, top, mix_ratio=1e12):
+    """Add a LeeMie contribution and collect its fitting parameters.
+
+    Parameters
+    ----------
+    model:
+        The model to add the contribution to
+
+    bottom, top:
+        Boundary pressures in Pa; a negative value leaves that end open
+
+    mix_ratio:
+        Particle number density in m^-3
+
+    """
+    from taurex.contributions import LeeMieContribution
+
+    model.add_contribution(
+        LeeMieContribution(
+            lee_mie_radius=0.05,
+            lee_mie_q=40.0,
+            lee_mie_mix_ratio=mix_ratio,
+            lee_mie_bottomP=bottom,
+            lee_mie_topP=top,
+        )
+    )
+    # The model was built before the deck was added, so its fitting parameters
+    # have to be collected again; an input file adds its contributions first.
+    model.build()
 
 
 def compile_fit_params(model, observation, names):

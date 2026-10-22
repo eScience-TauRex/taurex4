@@ -384,7 +384,7 @@ class LaplaceOptimizer(Optimizer):
         self._map: t.Optional[npt.NDArray[np.float64]] = None
         self._median: t.Optional[npt.NDArray[np.float64]] = None
         self._covariance: t.Optional[npt.NDArray[np.float64]] = None
-        self._u_covariance: t.Optional[Array] = None
+        self._u_covariance: t.Optional[npt.NDArray[np.float64]] = None
         self._log_posterior: t.Optional[float] = None
         self._log_likelihood: t.Optional[float] = None
         self._fisher: t.Optional[npt.NDArray[np.float64]] = None
@@ -680,7 +680,9 @@ class LaplaceOptimizer(Optimizer):
         # JAX dispatches asynchronously, so the result is waited on here: the
         # optimiser loop runs on the device and the wall clock only measures it
         # once something asks for the value.
-        u_map, gradient_norm, steps, trials, _ = jax.block_until_ready(solve(starts))
+        u_map, gradient_norm, steps, trials, score = jax.block_until_ready(
+            solve(starts)
+        )
         self.fit_time = time.perf_counter() - started
 
         self.iterations = int(steps)
@@ -705,14 +707,20 @@ class LaplaceOptimizer(Optimizer):
         self._map = np.asarray(theta_full[: self._n_physical]).copy()
         if jitter:
             self._jitter_map = float(theta_full[self._n_physical])
-            error_effective = jnp.sqrt(error**2 + theta_full[self._n_physical] ** 2)
+            # Host arithmetic: four operations on a vector of the length of the
+            # data, which are cheaper to compute than to dispatch.
+            error_effective = np.sqrt(np.asarray(error) ** 2 + self._jitter_map**2)
         else:
             self._jitter_map = None
             error_effective = error
         self._log_likelihood = float(
             log_likelihood_of(theta_full[: self._n_physical], data, error_effective)
         )
-        self._log_posterior = float(-objective(u_map))
+        # The compiled fit already returned the negative log posterior at the
+        # point it kept, so it does not have to be evaluated again: calling
+        # ``objective`` here would run the whole atmosphere eagerly, which
+        # costs a small compilation per operation rather than a dispatch.
+        self._log_posterior = -float(score)
 
         started = time.perf_counter()
         if self.sampler == "nuts":
@@ -1030,29 +1038,37 @@ class LaplaceOptimizer(Optimizer):
         variance_scale:
             Factor that turns that covariance into the covariance of ``u``
 
+        Notes
+        -----
+        Only the Hessian itself is a device computation. The matrix it
+        produces is ``nparams`` by ``nparams``, so the scaling, the ridge and
+        the inversion are done in numpy on the host: each operation of a few
+        hundred entries costs more to dispatch on the device than to compute,
+        and leaving them in JAX compiles one small program per operation.
+
         """
-        hessian = hessian_of(u_map)
+        hessian = np.asarray(hessian_of(u_map))
         hessian = 0.5 * (hessian + hessian.T)
 
-        largest = float(jnp.max(jnp.abs(hessian)))
+        largest = float(np.max(np.abs(hessian)))
         if largest == 0.0 or not np.isfinite(largest):
             # A flat posterior is not an error: there is simply nothing for the
             # data to constrain, so every sample is the optimum itself.
             size = hessian.shape[0]
-            return jnp.eye(size, dtype=hessian.dtype), 0.0
+            return np.eye(size, dtype=hessian.dtype), 0.0
 
         scaled = hessian / largest
-        diagonal = jnp.diagonal(scaled)
+        diagonal = np.diagonal(scaled)
         # The regularisation is chosen so that the scaled matrix is strictly
         # diagonally dominant, which by Gershgorin's theorem makes it positive
         # definite whatever the numerical noise in the Hessian did to its
         # spectrum. Without it a flat or rank deficient Hessian produces a
         # matrix that cannot be factored at all.
-        off_diagonal = jnp.sum(jnp.abs(scaled), axis=1) - jnp.abs(diagonal)
-        shift = off_diagonal + jnp.clip(-diagonal, 0.0, None) + self.eigenvalue_floor
-        regularized = scaled + jnp.diag(shift)
+        off_diagonal = np.sum(np.abs(scaled), axis=1) - np.abs(diagonal)
+        shift = off_diagonal + np.clip(-diagonal, 0.0, None) + self.eigenvalue_floor
+        regularized = scaled + np.diag(shift)
 
-        covariance = jnp.linalg.inv(regularized)
+        covariance = np.linalg.inv(regularized)
         covariance = 0.5 * (covariance + covariance.T)
         return covariance, 1.0 / largest
 
@@ -1085,8 +1101,8 @@ class LaplaceOptimizer(Optimizer):
             Covariance in parameter space
 
         """
-        jacobian = jacobian_of(u_map)
-        full = jacobian @ (covariance * variance_scale) @ jacobian.T
+        jacobian = np.asarray(jacobian_of(u_map))
+        full = jacobian @ (np.asarray(covariance) * variance_scale) @ jacobian.T
         full = 0.5 * (full + full.T)
         return np.asarray(full).copy()
 
@@ -1126,17 +1142,24 @@ class LaplaceOptimizer(Optimizer):
             Samples with shape ``(num_samples, nparams)``
 
         """
-        key = jax.random.PRNGKey(0 if self.seed is None else int(self.seed))
-        factor = jnp.linalg.cholesky(covariance)
-        normal = jax.random.normal(
-            key, (self.num_samples, u_map.shape[0]), dtype=covariance.dtype
+        seed = 0 if self.seed is None else int(self.seed)
+        # The draws are built on the host: a Gaussian with a handful of
+        # columns costs more to dispatch on the device than to compute, and
+        # the compiled transform below is the only part that needs to be a
+        # program of its own. Drawing the deviates through
+        # :func:`jax.random.normal` outside a compiled function compiles the
+        # whole bit generator chain for two thousand by four numbers, which
+        # costs about a second on the first call.
+        factor = np.linalg.cholesky(np.asarray(covariance))
+        normal = np.random.default_rng(seed).standard_normal(
+            (self.num_samples, u_map.shape[0])
         )
         offset = normal @ factor.T * float(np.sqrt(variance_scale))
-        draws = u_map[None, :] + offset
+        draws = np.asarray(u_map)[None, :] + offset
         # One traced call for all the samples: the transform is a handful of
         # scalar operations per parameter, so a python loop over two thousand
         # draws would be pure dispatch overhead.
-        theta = transform_of(draws)
+        theta = transform_of(jnp.asarray(draws))
         return np.asarray(theta).copy()
 
     def _starting_point(

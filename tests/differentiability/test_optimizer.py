@@ -87,6 +87,46 @@ def test_map_recovers_injected_parameters(optimizer, taurex_model, observation):
     )
 
 
+def test_map_recovers_a_leemie_cloud(data_path, observation):
+    """A fit converges with a LeeMie deck whose top and radius are free.
+
+    The deck is fitted on the thin model so the cloud is what the spectrum
+    depends on; with the default optically thick fixtures the transmission is
+    zero in every layer and the cloud parameters would be unconstrained.
+    """
+    from .conftest import add_leemie_deck
+    from .conftest import build_thin_model
+    from .conftest import layer_midpoints
+
+    model = build_thin_model()
+    _, top = layer_midpoints(model)
+    add_leemie_deck(model, layer_midpoints(model)[0], top)
+
+    truth_by_name = {
+        "planet_radius": 1.05,
+        "lee_mie_topP": np.log10(top * 0.5),
+        "lee_mie_radius": 0.05,
+    }
+
+    optimizer = LaplaceOptimizer(num_samples=100, max_iterations=100)
+    optimizer.set_model(model)
+    optimizer.set_observed(observation)
+    for name in truth_by_name:
+        optimizer.enable_fit(name)
+
+    truth = np.array([truth_by_name[p.name] for p in optimizer.fitting_parameters])
+    optimizer.update_model(truth)
+    atmosphere = Atmosphere(model, observation, fit_params=optimizer.fitting_parameters)
+    observation._obs_spectrum[:, 1] = np.asarray(
+        atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64))
+    ).copy()
+    optimizer.update_model(truth)
+
+    optimizer.compute_fit()
+
+    np.testing.assert_allclose(optimizer._map, truth, rtol=0.0, atol=1e-4)
+
+
 def test_map_is_the_minimum(optimizer, taurex_model, observation):
     """Chi-squared does not decrease when the fit is restarted from the MAP."""
     make_data(optimizer, taurex_model, observation, TRUTH)

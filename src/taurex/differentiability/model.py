@@ -34,6 +34,7 @@ import numpy as np
 from taurex.contributions import AbsorptionContribution
 from taurex.contributions import CIAContribution
 from taurex.contributions import FlatMieContribution
+from taurex.contributions import LeeMieContribution
 from taurex.contributions import RayleighContribution
 from taurex.core.priors import PriorMode
 from taurex.types import get_float_dtype
@@ -329,37 +330,87 @@ class OpacityInterpolator:
         t_low, t_high = physics.find_closest_pair(self.temperature_grid, temperature)
         p_low, p_high = physics.find_closest_pair(self.log_pressure_grid, log_pressure)
 
-        q11 = self.table[p_low, t_low]
-        q12 = self.table[p_low, t_high]
-        q21 = self.table[p_high, t_low]
-        q22 = self.table[p_high, t_high]
-
-        t_min = self.temperature_grid[t_low][:, None]
-        t_max = self.temperature_grid[t_high][:, None]
-        p_min = self.log_pressure_grid[p_low][:, None]
-        p_max = self.log_pressure_grid[p_high][:, None]
-        t_col = temperature[:, None]
-        p_col = log_pressure[:, None]
-
-        if self.mode == "linear":
-            bilinear = physics.interp_bilin(
-                q11, q12, q21, q22, t_col, t_min, t_max, p_col, p_min, p_max
-            )
-        elif self.mode == "exp":
-            bilinear = physics.interp_exp_and_lin(
-                q11, q12, q21, q22, t_col, t_min, t_max, p_col, p_min, p_max
-            )
-        else:
-            raise ValueError(f"Unknown interpolation mode {self.mode}")
-
         over_pressure = log_pressure >= self.log_pressure_grid[-1]
         over_temperature = temperature >= self.temperature_grid[-1]
         under_pressure = log_pressure < self.log_pressure_grid[0]
         under_temperature = temperature < self.temperature_grid[0]
 
-        # Past the edge of the grid one axis is pinned to the last or first
-        # entry and the other keeps its dependence, exactly as
-        # interp_temp_only / interp_pressure_only do.
+        t_col = temperature[:, None]
+        p_col = log_pressure[:, None]
+
+        def interpolate(t_low: Array, t_high: Array, p_low: Array, p_high: Array):
+            """Interpolate on the four corners the index pairs select."""
+            q11 = self.table[p_low, t_low]
+            q12 = self.table[p_low, t_high]
+            q21 = self.table[p_high, t_low]
+            q22 = self.table[p_high, t_high]
+
+            t_min = self.temperature_grid[t_low][:, None]
+            t_max = self.temperature_grid[t_high][:, None]
+            p_min = self.log_pressure_grid[p_low][:, None]
+            p_max = self.log_pressure_grid[p_high][:, None]
+
+            if self.mode == "linear":
+                return physics.interp_bilin(
+                    q11, q12, q21, q22, t_col, t_min, t_max, p_col, p_min, p_max
+                )
+            if self.mode == "exp":
+                return physics.interp_exp_and_lin(
+                    q11, q12, q21, q22, t_col, t_min, t_max, p_col, p_min, p_max
+                )
+            raise ValueError(f"Unknown interpolation mode {self.mode}")
+
+        def mask(flag: Array) -> Array:
+            return flag[:, None]
+
+        if self.mode == "linear":
+            # Past the edge of the grid one axis is pinned to the last or first
+            # entry and the other keeps its dependence, exactly as
+            # interp_temp_only / interp_pressure_only do. Pinning both
+            # bracketing indices of an axis to one entry makes that axis'
+            # interpolation weight vanish, so a clamped pair of indices
+            # reproduces those branches instead of evaluating four more
+            # interpolations whose results are then discarded by `where`.
+            # The four cases are tried in the order of the numpy cascade, so a
+            # layer that is out of range in both axes keeps the extrapolation
+            # in the other axis that the cascade performs.
+            last_t = self.temperature_grid.shape[0] - 1
+            last_p = self.log_pressure_grid.shape[0] - 1
+            pin_p_max = over_pressure
+            pin_t_max = ~pin_p_max & over_temperature
+            pin_p_min = ~pin_p_max & ~pin_t_max & under_pressure
+            pin_t_min = ~pin_p_max & ~pin_t_max & ~pin_p_min & under_temperature
+
+            t_low = jnp.where(pin_t_max, last_t, jnp.where(pin_t_min, 0, t_low))
+            t_high = jnp.where(pin_t_max, last_t, jnp.where(pin_t_min, 0, t_high))
+            p_low = jnp.where(pin_p_max, last_p, jnp.where(pin_p_min, 0, p_low))
+            p_high = jnp.where(pin_p_max, last_p, jnp.where(pin_p_min, 0, p_high))
+
+            result = interpolate(t_low, t_high, p_low, p_high)
+            # The two corners of the grid are single values rather than one
+            # dimensional interpolations and override the clamped result.
+            result = jnp.where(
+                mask(over_pressure & over_temperature), self.table[-1, -1], result
+            )
+            result = jnp.where(
+                mask(under_pressure & under_temperature),
+                jnp.zeros_like(result),
+                result,
+            )
+            return result / 10000.0
+
+        if self.mode != "exp":
+            raise ValueError(f"Unknown interpolation mode {self.mode}")
+
+        bilinear = interpolate(t_low, t_high, p_low, p_high)
+        t_min = self.temperature_grid[t_low][:, None]
+        t_max = self.temperature_grid[t_high][:, None]
+        p_min = self.log_pressure_grid[p_low][:, None]
+        p_max = self.log_pressure_grid[p_high][:, None]
+
+        # The exponential interpolation divides by the temperature and pressure
+        # spans, so a pinned axis cannot be expressed by clamping its indices
+        # and the branches are evaluated explicitly.
         def temperature_branch(pressure_index: int) -> Array:
             return interp_temperature(
                 self.table[pressure_index, t_low],
@@ -384,21 +435,18 @@ class OpacityInterpolator:
         under_pressure_value = temperature_branch(0)
         under_temperature_value = pressure_branch(0)
 
-        def mask(flag: Array) -> Array:
-            return flag[:, None]
-
-        result = jnp.where(
-            mask(over_pressure & over_temperature), self.table[-1, -1], bilinear
-        )
-        result = jnp.where(
-            mask(under_pressure & under_temperature),
-            jnp.zeros_like(bilinear),
-            result,
-        )
-        result = jnp.where(mask(over_pressure), over_pressure_value, result)
+        result = jnp.where(mask(over_pressure), over_pressure_value, bilinear)
         result = jnp.where(mask(over_temperature), over_temperature_value, result)
         result = jnp.where(mask(under_pressure), under_pressure_value, result)
         result = jnp.where(mask(under_temperature), under_temperature_value, result)
+        result = jnp.where(
+            mask(under_pressure & under_temperature),
+            jnp.zeros_like(result),
+            result,
+        )
+        result = jnp.where(
+            mask(over_pressure & over_temperature), self.table[-1, -1], result
+        )
         return result / 10000.0
 
 
@@ -584,6 +632,44 @@ class CiaPlan(ContributionPlan):
         return sigma
 
 
+def _log_boundary(
+    atmosphere: "Atmosphere",
+    values: t.Dict[str, Array],
+    name: str,
+    fallback: t.Optional[Array] = None,
+) -> t.Optional[Array]:
+    """Log10 pressure of an optional cloud deck boundary.
+
+    A negative or missing value means the input file left the boundary unset.
+    In that case ``fallback`` is returned, which may be None for a plan that
+    has a better answer for an unset boundary than a number.
+
+    Parameters
+    ----------
+    atmosphere:
+        The atmosphere the plan belongs to, used to read parameter values
+
+    values:
+        Physical parameter values
+
+    name:
+        Name of the boundary pressure parameter
+
+    fallback:
+        Log10 pressure to use when the parameter is unset
+
+    Returns
+    -------
+    :obj:`jax.Array` or None
+        Log10 boundary pressure
+
+    """
+    current = atmosphere._all_params[name][2]()
+    if current is None or current < 0:
+        return fallback
+    return jnp.log10(atmosphere._value(values, name))
+
+
 class FlatMiePlan(ContributionPlan):
     """Flat, grey absorption between two pressures.
 
@@ -692,10 +778,123 @@ class FlatMiePlan(ContributionPlan):
             Log10 boundary pressure
 
         """
-        current = self._atmosphere._all_params[name][2]()
-        if current is None or current < 0:
-            return fallback
-        return jnp.log10(self._atmosphere._value(values, name))
+        return _log_boundary(self._atmosphere, values, name, fallback)
+
+
+class LeeMiePlan(ContributionPlan):
+    r"""Mie scattering after Lee et al. 2013 inside a pressure window.
+
+    Port of
+    :meth:`taurex.contributions.leemie.LeeMieContribution.prepare_each`. The
+    cross-section is the Lee parametrisation
+
+    .. math::
+
+        \sigma_\mathrm{mie} = \frac{5}{Q_\mathrm{ext} x^{-4} + x^{0.2}}
+        \pi a^2, \qquad x = \frac{2 \pi a}{\lambda},
+
+    weighted by the particle number density, so the plan carries its own
+    normalisation and :attr:`density_power` is zero.
+
+    The numpy code multiplies the cross-section by a boolean mask that is one
+    between the two deck boundaries. A comparison against a traced pressure has
+    no gradient, so the mask is replaced here by the product of two sigmoids in
+    :math:`\log_{10} P`, one at each boundary. Their width is
+    :attr:`width_in_layers` layers of the pressure grid. For a boundary that
+    falls midway between two layer centres the sigmoid gives 0.88 to the layer
+    inside it and 0.12 to the layer outside, so the pair carries the column the
+    step function selects and the deviation one layer further in is 2.5e-3. A
+    boundary the input leaves unset contributes a factor of exactly one, as in
+    the numpy mask.
+
+    Parameters
+    ----------
+    atmosphere:
+        The atmosphere the plan belongs to, used to read parameter values
+
+    pressure_centres:
+        Pressure at each layer centre in Pa, as the numpy contribution uses it
+
+    wavenumbers:
+        Working wavenumber grid in cm^-1
+
+    """
+
+    name = "LeeMie"
+    density_power = 0
+
+    #: Width of each sigmoid, in units of one layer of the log10 pressure grid.
+    #: A boundary midway between two centres leaves the layer outside it with
+    #: ``exp(-0.5 / width_in_layers)`` of the cross-section.
+    width_in_layers = 0.25
+
+    def __init__(
+        self,
+        atmosphere: "Atmosphere",
+        pressure_centres: np.ndarray,
+        wavenumbers: Array,
+    ) -> None:
+        """Initialise the plan.
+
+        Parameters
+        ----------
+        atmosphere:
+            The atmosphere the plan belongs to, used to read parameter values
+
+        pressure_centres:
+            Pressure at each layer centre in Pa
+
+        wavenumbers:
+            Working wavenumber grid in cm^-1
+
+        """
+        self._atmosphere = atmosphere
+        self._wavenumbers = wavenumbers
+
+        log_centres = np.log10(np.asarray(pressure_centres, dtype=get_float_dtype()))
+        if log_centres.shape[0] > 1:
+            spacing = float(np.median(np.abs(np.diff(np.sort(log_centres)))))
+        else:
+            spacing = 1.0
+        self._width = self.width_in_layers * spacing if spacing > 0.0 else 0.25
+
+    def sigma(self, values, thermal):
+        """Cross-section of the cloud deck, in m^2."""
+        # An unset boundary leaves the deck open at that end: the numpy mask
+        # then includes every layer up to the end of the grid, so the
+        # corresponding factor is exactly one here rather than a sigmoid
+        # centred on the last layer.
+        top = _log_boundary(self._atmosphere, values, "lee_mie_topP")
+        bottom = _log_boundary(self._atmosphere, values, "lee_mie_bottomP")
+
+        log_pressure = thermal.log_pressure
+        mask = jnp.ones_like(log_pressure)
+        if bottom is not None and top is not None:
+            # Soft replacement for the boolean pressure window of the numpy
+            # contribution. Each factor is one inside the deck and goes to zero
+            # across one boundary, so the product is the window; being sigmoids
+            # they also give a fitted boundary a gradient.
+            low = jnp.minimum(top, bottom)
+            high = jnp.maximum(top, bottom)
+            mask = jax.nn.sigmoid((high - log_pressure) / self._width)
+            mask = mask * jax.nn.sigmoid((log_pressure - low) / self._width)
+        elif bottom is not None:
+            mask = jax.nn.sigmoid((bottom - log_pressure) / self._width)
+        elif top is not None:
+            mask = jax.nn.sigmoid((log_pressure - top) / self._width)
+
+        radius = self._atmosphere._value(values, "lee_mie_radius")
+        q_ext = self._atmosphere._value(values, "lee_mie_q")
+        mix = self._atmosphere._value(values, "lee_mie_mix_ratio")
+
+        # 1e4 / wavenumber is the wavelength in um, so the size parameter is
+        # built on the wavenumber axis alone and only the nwn values are
+        # exponentiated, not the whole (nlayers, nwn) grid.
+        x = 2.0 * jnp.pi * radius * self._wavenumbers / 1e4
+        extinction = 5.0 / (q_ext * x ** (-4.0) + x**0.2)
+        sigma_mie = extinction * jnp.pi * (radius * 1e-6) ** 2
+
+        return (sigma_mie * mix)[None, :] * mask[:, None]
 
 
 class Atmosphere:
@@ -881,10 +1080,10 @@ class Atmosphere:
         )
         self._n_layers = model.nLayers
         self._p_levels = physics.as_array(self._pressure_levels, dtype=self.dtype)
-        self._p_centres = physics.as_array(
-            np.asarray(pressure.pressure_profile, dtype=get_float_dtype()),
-            dtype=self.dtype,
+        self._p_centres_np = np.asarray(
+            pressure.pressure_profile, dtype=get_float_dtype()
         )
+        self._p_centres = physics.as_array(self._p_centres_np, dtype=self.dtype)
 
         self._r_jup = RJUP
         self._m_jup = MJUP
@@ -1087,11 +1286,19 @@ class Atmosphere:
                 self._plans.append(self._cia_plan(contribution))
             elif isinstance(contribution, FlatMieContribution):
                 self._plans.append(FlatMiePlan(self, self._pressure_levels))
+            elif isinstance(contribution, LeeMieContribution):
+                self._plans.append(
+                    LeeMiePlan(
+                        self,
+                        self._p_centres_np,
+                        physics.as_array(self.wngrid, dtype=self.dtype),
+                    )
+                )
             else:
                 raise NotImplementedError(
                     "The differentiable model does not implement "
                     f"{type(contribution).__name__}; it supports Absorption, "
-                    "Rayleigh, CIA and FlatMie."
+                    "Rayleigh, CIA, FlatMie and LeeMie."
                 )
 
     def _absorption_plan(self) -> AbsorptionPlan:
