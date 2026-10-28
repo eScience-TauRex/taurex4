@@ -191,11 +191,38 @@ def test_solution_exposes_map_and_median(optimizer, taurex_model, observation):
 
     index, map_values, median_values, extra = solutions[0]
     assert index == 0
-    assert extra == []
     np.testing.assert_allclose(map_values, optimizer._map)
     np.testing.assert_allclose(
         median_values, np.median(optimizer.get_samples(0), axis=0)
     )
+    # The draws are stored under the keys multinest writes, otherwise
+    # taurex-plot has no posteriors to draw.
+    assert [k for k, _ in extra] == ["fit_params", "tracedata", "weights"]
+
+
+def test_solution_stores_the_posterior_samples(optimizer, taurex_model, observation):
+    """Fit parameters and the draws behind them reach the output file."""
+    make_data(optimizer, taurex_model, observation, TRUTH)
+    optimizer.compute_fit()
+
+    _, _, _, extra = next(optimizer.get_solution())
+    values = dict(extra)
+    samples = optimizer.get_samples(0)
+
+    np.testing.assert_allclose(values["tracedata"], samples)
+    np.testing.assert_allclose(values["weights"], optimizer.get_weights(0))
+    assert set(values["fit_params"]) == set(optimizer.fit_names)
+
+    for idx, param_name in enumerate(optimizer.fit_names):
+        param = values["fit_params"][param_name]
+        # The value and the two-sided errors are quantiles of the same draws,
+        # so they have to sit on the median of those draws.
+        assert param["value"] == pytest.approx(
+            np.median(samples[:, idx]), rel=1e-6
+        )
+        assert param["sigma_m"] > 0.0
+        assert param["sigma_p"] > 0.0
+        assert param["trace"].shape == (optimizer.num_samples,)
 
 
 def test_reported_timings_and_counts(optimizer, taurex_model, observation):

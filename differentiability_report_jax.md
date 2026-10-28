@@ -116,9 +116,17 @@ outside it, leaving the original numpy path for everything else:
 
 - Profile and spectrum uncertainties are computed with one `jax.vmap`-ed call
   instead of the original per-sample numpy loop.
-- Under MPI the original partitions the post-processing across ranks; the JAX
-  path evaluates the same draws on every rank, which is correct but duplicated.
-  The sampling optimizers keep their MPI behaviour.
+- Under MPI only the root rank fits. The quasi-Newton chain is serial and XLA
+  already spreads each compiled program over the cores, so an extra rank cannot
+  shorten a fit: it would only build a second copy of the atmosphere, compile a
+  second set of executables and repeat the identical computation. The mode, the
+  draws and their covariance are broadcast to the rest of the job, which is a
+  few thousand floats against a copy of the model. Profile bands are likewise
+  computed on the root rank with the compiled model and broadcast as the few
+  vectors they are, instead of every rank evaluating the same draws.
+  A JAX run therefore gains nothing from more than one rank per node and loses
+  a factor of the job size in peak memory; the sampling optimizers keep their
+  MPI behaviour.
 - New outputs that an original input file does not produce: the parameter
   covariance, `fisher_information()`, the fitted jitter, and the
   `compile_time` / `fit_time` / `laplace_time` / `iterations` /

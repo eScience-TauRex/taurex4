@@ -44,6 +44,7 @@ from taurex.core.priors import Uniform
 from taurex.model import ForwardModel
 from taurex.optimizer.optimizer import Optimizer
 from taurex.spectrum import BaseSpectrum
+from taurex.util import quantile_corner
 
 from .model import Atmosphere
 
@@ -55,6 +56,27 @@ _PROFILE_BATCH_BYTES = 8 * 1024 * 1024
 
 _PROFILE_ARRAYS_PER_DRAW = 5
 """Roughly how many ``(nlayers, nwn)`` arrays one forward pass keeps live."""
+
+_BROADCAST_FIT_FIELDS = (
+    "_map",
+    "_median",
+    "_samples",
+    "_covariance",
+    "_u_covariance",
+    "_log_posterior",
+    "_log_likelihood",
+    "_fisher",
+    "_jitter_map",
+    "_n_physical",
+    "_nuts_parameters",
+    "iterations",
+    "function_evaluations",
+    "gradient_evaluations",
+    "compile_time",
+    "fit_time",
+    "laplace_time",
+)
+"""Results a fit produces, sent from the root rank to the rest of the job."""
 
 
 class PriorTransform:
@@ -409,7 +431,34 @@ class LaplaceOptimizer(Optimizer):
         :attr:`sampler`. ``laplace`` describes the posterior with the Gaussian
         the Hessian implies, ``nuts`` draws exact samples from it with the
         Laplace covariance as the initial mass matrix.
+
+        Under MPI only the root rank fits. The quasi-Newton chain is serial and
+        the gradient is already spread over every core by XLA, so extra ranks
+        cannot shorten it: they would each build their own copy of the
+        atmosphere, compile their own executables and repeat the identical
+        fit. The root broadcasts the posterior instead, which keeps the peak
+        memory of a job at one compiled model however many ranks it has.
         """
+        from taurex.mpi import get_rank
+        from taurex.mpi import nprocs
+
+        if nprocs() > 1 and get_rank() != 0:
+            self._receive_fit()
+            return
+        if nprocs() > 1:
+            # A pipeline that allocates a whole node per rank still gets a
+            # correct answer, but only this rank does the fit and the others
+            # sit in the broadcast, so the job is slower than one rank with
+            # the node to itself. Saying so is cheaper than a walltime limit
+            # spent wondering why 128 ranks did not help.
+            self.warning(
+                "Fitting on 1 of %d MPI ranks: the quasi-Newton chain is "
+                "sequential and XLA spreads each step over the cores of one "
+                "process, so the other ranks wait for the result rather than "
+                "sharing the work",
+                nprocs(),
+            )
+
         fit_params = self.fitting_parameters
         if not fit_params:
             raise ValueError(
@@ -759,6 +808,29 @@ class LaplaceOptimizer(Optimizer):
             ].copy()
         self.laplace_time = time.perf_counter() - started
 
+        if nprocs() > 1:
+            self._broadcast_fit()
+
+    def _broadcast_fit(self) -> None:
+        """Send the fitted posterior from the root rank to the other ranks.
+
+        The payload is the posterior itself - mode, draws, covariance and the
+        fitted nuisance values - plus the counters that describe the fit. It
+        is a few thousand floats, so broadcasting it costs far less than a
+        second copy of the atmosphere or a second compilation.
+        """
+        from taurex.mpi import broadcast
+
+        broadcast({name: getattr(self, name) for name in _BROADCAST_FIT_FIELDS})
+
+    def _receive_fit(self) -> None:
+        """Take the fitted posterior broadcast by the root rank."""
+        from taurex.mpi import broadcast
+
+        payload = broadcast(None)
+        for name, value in payload.items():
+            setattr(self, name, value)
+
     def _run_nuts(
         self,
         objective: t.Callable[[Array], Array],
@@ -890,8 +962,17 @@ class LaplaceOptimizer(Optimizer):
             Profile and spectrum error dictionaries
 
         """
-        if self._samples is None or self.atmosphere is None:
+        from taurex import mpi
+
+        if self._samples is None:
             return super().generate_profiles(solution, binning)
+
+        if self.atmosphere is None:
+            # A rank that did not run the fit has no compiled atmosphere, so
+            # it takes the bands the fitting rank computed. These are a few
+            # vectors the length of the profile and spectrum grids, which is
+            # cheaper to send than to re-evaluate the draws here.
+            return mpi.broadcast(None)
 
         atmosphere = self.atmosphere
         # The draws are evaluated inside the compiled program, in a batch
@@ -931,7 +1012,10 @@ class LaplaceOptimizer(Optimizer):
             # operator is a plain matrix so there is nothing to map.
             binned = jnp.matmul(depth, atmosphere.binning_matrix.T)
             spectrum_dict["binned_std"] = np.asarray(jnp.std(binned, axis=0))
-        return profile_dict, spectrum_dict
+        result = (profile_dict, spectrum_dict)
+        if mpi.nprocs() > 1:
+            mpi.broadcast(result)
+        return result
 
     def fisher_information(
         self,
@@ -1206,10 +1290,69 @@ class LaplaceOptimizer(Optimizer):
             Median of the Laplace samples
 
         extra:
-            Empty; a Laplace approximation produces no extra outputs
+            Samples, their weights and the per-parameter summaries taken from
+            them, under the same keys :class:`~taurex.optimizer.multinest.
+            MultiNestOptimizer` writes. The two samplers here already hold the
+            draws: the Laplace approximation makes ``num_samples`` of them from
+            the fitted covariance and NUTS makes them from the chains, and
+            until now only the median of those draws was used and the draws
+            themselves dropped, which left the output file with no
+            ``fit_params``/``tracedata``/``weights`` and made
+            ``taurex-plot --plot-posteriors`` (and any comparison against a
+            nested-sampling corner plot) impossible. Storing them costs one
+            array of ``num_samples`` x ``nparams`` floats, so no extra
+            likelihood evaluations.
 
         """
-        yield 0, self._map, self._median, []
+        yield 0, self._map, self._median, [
+            ("fit_params", self._fit_params()),
+            ("tracedata", self.get_samples(0)),
+            ("weights", self.get_weights(0)),
+        ]
+
+    def _fit_params(self) -> t.Dict[str, t.Dict[str, t.Any]]:
+        """Summarise the samples of every fitted parameter.
+
+        ``value``, ``sigma_m`` and ``sigma_p`` are the 16/50/84 weighted
+        quantiles of the draws, computed with
+        :func:`~taurex.util.quantile_corner` and read with the same keys
+        ``multinest.get_solution`` writes, so the plotter and the parameter
+        table need no branch per optimizer. ``laplace_sigma`` additionally
+        carries the diagonal of the fitted covariance, which is the error bar
+        the approximation itself quotes; comparing it with ``sigma_m`` and
+        ``sigma_p`` shows where the prior transform has bent the draws away
+        from the Gaussian.
+
+        Returns
+        -------
+        :obj:`dict`
+            Mapping of parameter name to its summary
+
+        """
+        samples = self.get_samples(0)
+        weights = self.get_weights(0)
+        covariance = self._covariance
+        summary = {}
+        for idx, param_name in enumerate(self.fit_names):
+            trace = samples[:, idx]
+            q_16, q_50, q_84 = quantile_corner(
+                trace,
+                [0.16, 0.5, 0.84],
+                weights=weights,
+            )
+            summary[param_name] = {
+                "value": q_50,
+                "sigma_m": q_50 - q_16,
+                "sigma_p": q_84 - q_50,
+                "mean": np.average(trace, weights=weights),
+                "laplace_sigma": (
+                    float(np.sqrt(covariance[idx, idx]))
+                    if covariance is not None
+                    else float("nan")
+                ),
+                "trace": trace,
+            }
+        return summary
 
     def get_samples(self, solution_id: int) -> npt.NDArray[np.float64]:
         """Posterior samples drawn from the Laplace approximation.
