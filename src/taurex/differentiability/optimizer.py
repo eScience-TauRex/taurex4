@@ -57,6 +57,12 @@ _PROFILE_BATCH_BYTES = 8 * 1024 * 1024
 _PROFILE_ARRAYS_PER_DRAW = 5
 """Roughly how many ``(nlayers, nwn)`` arrays one forward pass keeps live."""
 
+_NUTS_PROGRESS_INTERVAL = 300.0
+"""Seconds of NUTS sampling between two progress messages."""
+
+_NUTS_PROGRESS_PROBE = 100
+"""Length of the measuring block as a fraction ``1/n`` of the run."""
+
 _BROADCAST_FIT_FIELDS = (
     "_map",
     "_median",
@@ -903,6 +909,7 @@ class LaplaceOptimizer(Optimizer):
         warmup = blackjax.window_adaptation(
             blackjax.nuts, logdensity_v, is_mass_matrix_diagonal=True
         )
+        self.info("NUTS: adapting the step size over %d warm-up steps", self.num_warmup)
         (state, parameters), _ = warmup.run(
             warmup_key,
             jnp.zeros(dimension, dtype=covariance_u.dtype),
@@ -915,18 +922,91 @@ class LaplaceOptimizer(Optimizer):
         algorithm = blackjax.nuts(logdensity_v, **parameters)
 
         steps_per_chain = max(1, self.num_samples // self.num_chains)
+        self.info(
+            "NUTS: %d chains x %d steps, step size %.3g after %d warm-up steps",
+            self.num_chains,
+            steps_per_chain,
+            self._nuts_parameters["step_size"],
+            self.num_warmup,
+        )
         chain_keys = jax.random.split(sample_key, self.num_chains)
         step_keys = jax.vmap(lambda k: jax.random.split(k, steps_per_chain))(chain_keys)
 
-        def one_chain(keys: Array) -> Array:
-            def one_step(current, step_key):
-                current, _ = algorithm.step(step_key, current)
-                return current, current.position
+        def run_block(states: t.Any, keys: t.Any) -> t.Tuple[t.Any, Array]:
+            """Advance every chain by ``keys.shape[1]`` steps in one program.
 
-            return jax.lax.scan(one_step, state, keys)[1]
+            The steps of a block are scanned inside a single compiled call, so
+            the block boundary costs a compilation and no python work per step.
+            """
 
-        positions_v = jax.vmap(one_chain)(step_keys).reshape(-1, dimension)
-        positions = u_map[None, :] + jax.block_until_ready(positions_v) @ factor.T
+            def one_chain(current: t.Any, chain_keys: Array) -> t.Tuple[t.Any, Array]:
+                def one_step(
+                    current: t.Any, step_key: Array
+                ) -> t.Tuple[t.Any, Array]:
+                    current, _ = algorithm.step(step_key, current)
+                    return current, current.position
+
+                return jax.lax.scan(one_step, current, chain_keys)
+
+            return jax.vmap(one_chain)(states, keys)
+
+        run_block = jax.jit(run_block)
+        # Every chain starts from the state the warm-up stopped at; the keys
+        # below are the only thing that differs between them.
+        states = jax.tree_util.tree_map(
+            lambda leaf: jnp.broadcast_to(
+                jnp.asarray(leaf), (self.num_chains,) + jnp.shape(leaf)
+            ),
+            state,
+        )
+        # The run is split into blocks only so that progress can be reported:
+        # each block is a compiled scan over its own steps and all chains, so
+        # the sampled sequence is the same as one long scan and nothing runs
+        # in python inside the sampler. The price is a compilation per block
+        # size, and there are at most three of those in a run: the measuring
+        # block, the size chosen from it, and the remainder.
+        probe = max(1, steps_per_chain // _NUTS_PROGRESS_PROBE)
+        block = probe
+        probe_calls = 0
+        per_step: t.Optional[float] = None
+        blocks: t.List[Array] = []
+        done = 0
+        started = time.perf_counter()
+        while done < steps_per_chain:
+            size = min(block, steps_per_chain - done)
+            call_started = time.perf_counter()
+            states, block_positions = run_block(
+                states, step_keys[:, done : done + size]
+            )
+            # Waiting here is what makes the timing below meaningful; the
+            # positions are needed anyway, so it costs nothing extra.
+            blocks.append(jax.block_until_ready(block_positions))
+            done += size
+            call_time = time.perf_counter() - call_started
+            if per_step is None:
+                probe_calls += 1
+                if probe_calls < 2 and done + probe <= steps_per_chain:
+                    # This call paid for the compilation of the scan body, so
+                    # its time is not the cost of a step. The next one, at the
+                    # same size and therefore the same compiled program, is.
+                    continue
+                per_step = call_time / size
+                block = max(
+                    probe,
+                    min(steps_per_chain, int(_NUTS_PROGRESS_INTERVAL / per_step)),
+                )
+            self.info(
+                "NUTS: %d/%d steps per chain (%.0f%%), %.0f s elapsed, "
+                "about %.0f s left",
+                done,
+                steps_per_chain,
+                100.0 * done / steps_per_chain,
+                time.perf_counter() - started,
+                (steps_per_chain - done) * per_step,
+            )
+
+        positions_v = jnp.concatenate(blocks, axis=1).reshape(-1, dimension)
+        positions = u_map[None, :] + positions_v @ factor.T
         theta = transform_of(positions)
         return np.asarray(theta[:, : self._n_physical]).copy()
 
