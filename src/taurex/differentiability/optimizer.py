@@ -390,11 +390,15 @@ class LaplaceOptimizer(Optimizer):
             sensible default; the base point itself is always included.
 
         num_warmup:
-            Warm-up steps for the NUTS window adaptation, per chain.
+            Warm-up steps for the NUTS window adaptation, per chain. NUTS only:
+            ``mclmc`` spends about a third of its own number of steps tuning
+            its step size and trajectory length, and ``importance`` and
+            ``laplace`` need no warm-up at all.
 
         num_chains:
-            Number of NUTS chains. The posterior draws are split evenly across
-            them, so a chain run also gives a crude convergence check.
+            Number of chains, for the samplers that run chains (``nuts`` and
+            ``mclmc``). The posterior draws are split evenly across them, so a
+            chain run also gives a crude convergence check.
 
         max_num_doublings:
             Longest NUTS trajectory, as a power of two: a draw integrates at
