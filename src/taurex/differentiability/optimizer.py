@@ -63,6 +63,24 @@ _NUTS_PROGRESS_INTERVAL = 300.0
 _NUTS_PROGRESS_PROBE = 100
 """Length of the measuring block as a fraction ``1/n`` of the run."""
 
+
+def _as_bool(value: t.Any) -> bool:
+    """Read an option the input file hands over as text.
+
+    The config reader returns every value as a string, and ``bool("False")``
+    is ``True``, so a switch set to off in an input file would silently be on.
+    Only the spellings below are accepted; anything else raises rather than
+    guessing which way the user meant.
+    """
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "yes", "1", "on"):
+            return True
+        if lowered in ("false", "no", "0", "off"):
+            return False
+        raise ValueError(f"Cannot read {value!r} as a boolean")
+    return bool(value)
+
 _BROADCAST_FIT_FIELDS = (
     "_map",
     "_median",
@@ -270,6 +288,8 @@ class LaplaceOptimizer(Optimizer):
         start_scale: t.Optional[float] = 0.5,
         num_warmup: t.Optional[int] = 500,
         num_chains: t.Optional[int] = 4,
+        max_num_doublings: t.Optional[int] = 10,
+        dense_mass_matrix: t.Optional[bool] = False,
         jitter: t.Optional[bool] = False,
         jitter_scale: t.Optional[float] = None,
         **kwargs: t.Any,
@@ -343,6 +363,18 @@ class LaplaceOptimizer(Optimizer):
             matrix, and returns exact, equally weighted posterior draws. Use
             ``nuts`` when the posterior is not Gaussian or when the error bars
             from the Laplace approximation look suspect.
+            ``importance`` reweights proposals drawn from a Student-t centred
+            on the mode with the Laplace covariance by the exact density. It
+            costs one forward pass per proposal and no gradients, and the
+            effective sample size it reports says how much of the posterior
+            the Gaussian captured: high means the Laplace description was
+            right, low means neither it nor these draws can be trusted.
+            ``mclmc`` runs Microcanonical Langevin Monte Carlo from
+            :mod:`blackjax`, which produces one sample per gradient rather
+            than the tens to hundreds a NUTS trajectory needs, and needs no
+            accept/reject and no trajectory length. It is the option to use
+            when the posterior is genuinely non-Gaussian and the gradient is
+            too expensive for NUTS; it needs at least two fitted parameters.
 
         n_starts:
             Number of independent starting points for the mode search. Each
@@ -363,6 +395,25 @@ class LaplaceOptimizer(Optimizer):
         num_chains:
             Number of NUTS chains. The posterior draws are split evenly across
             them, so a chain run also gives a crude convergence check.
+
+        max_num_doublings:
+            Longest NUTS trajectory, as a power of two: a draw integrates at
+            most ``2 ** max_num_doublings`` leapfrog steps, and each of those
+            is one gradient of the model. This is therefore the worst case
+            cost of one draw, and the knob to turn down when the progress
+            message reports a trajectory that long; lowering it truncates
+            trajectories that had not turned around yet, which biases the
+            draws, so it is a budget rather than a tuning parameter.
+
+        dense_mass_matrix:
+            Adapt a full mass matrix in the warm-up instead of a diagonal one.
+            The diagonal form can only fix the scale of each whitened
+            coordinate, not the correlations between them, so it leaves
+            whatever the Laplace covariance got wrong in place; a dense metric
+            measures the correlation from the warm-up draws and removes it. It
+            needs ``num_warmup`` to be at least a few times the number of
+            fitted parameters to estimate the matrix, and it changes nothing
+            when the Laplace whitening was already accurate.
 
         jitter:
             When True an extra nuisance coordinate is fitted: the per-bin
@@ -389,7 +440,7 @@ class LaplaceOptimizer(Optimizer):
         self.max_iterations = int(max_iterations)
         self.max_lbfgs_iterations = int(max_lbfgs_iterations)
         self.memory_size = int(memory_size)
-        self.scale_init_precond = bool(scale_init_precond)
+        self.scale_init_precond = _as_bool(scale_init_precond)
         self.gradient_tolerance = float(gradient_tolerance)
         self.eigenvalue_floor = float(eigenvalue_floor)
         self.seed = seed
@@ -397,13 +448,18 @@ class LaplaceOptimizer(Optimizer):
         self.ignored_options = kwargs
 
         self.sampler = str(sampler).lower()
-        if self.sampler not in ("laplace", "nuts"):
-            raise ValueError(f"Unknown sampler {sampler!r}; use 'laplace' or 'nuts'")
+        if self.sampler not in ("laplace", "nuts", "importance", "mclmc"):
+            raise ValueError(
+                f"Unknown sampler {sampler!r}; use 'laplace', 'nuts', "
+                "'importance' or 'mclmc'"
+            )
         self.n_starts = max(1, int(n_starts))
         self.start_scale = float(start_scale)
         self.num_warmup = int(num_warmup)
         self.num_chains = max(1, int(num_chains))
-        self.jitter = bool(jitter)
+        self.max_num_doublings = int(max_num_doublings)
+        self.dense_mass_matrix = _as_bool(dense_mass_matrix)
+        self.jitter = _as_bool(jitter)
         self.jitter_scale = None if jitter_scale is None else float(jitter_scale)
 
         self.atmosphere: t.Optional[Atmosphere] = None
@@ -778,7 +834,7 @@ class LaplaceOptimizer(Optimizer):
         self._log_posterior = -float(score)
 
         started = time.perf_counter()
-        if self.sampler == "nuts":
+        if self.sampler != "laplace":
             # The mass matrix has to describe the same density the sampler
             # targets, so the Hessian here includes the transform Jacobian.
             nuts_hessian_of = jax.jit(jax.hessian(nuts_objective), device=self.device)
@@ -788,10 +844,19 @@ class LaplaceOptimizer(Optimizer):
         else:
             covariance, variance_scale = self._laplace_covariance(hessian_of, u_map)
         self._u_covariance = covariance * variance_scale
-        if self.sampler == "nuts":
-            self._samples = self._run_nuts(
-                nuts_objective, u_map, covariance, variance_scale, transform_of
-            )
+        if self.sampler != "laplace":
+            if self.sampler == "nuts":
+                self._samples = self._run_nuts(
+                    nuts_objective, u_map, covariance, variance_scale, transform_of
+                )
+            elif self.sampler == "importance":
+                self._samples = self._run_importance_sampling(
+                    nuts_objective, u_map, covariance, variance_scale, transform_of
+                )
+            else:
+                self._samples = self._run_mclmc(
+                    nuts_objective, u_map, covariance, variance_scale, transform_of
+                )
             self._median = np.median(self._samples, axis=0)
             if self._samples.shape[0] > 1:
                 self._covariance = np.atleast_2d(np.cov(self._samples, rowvar=False))
@@ -907,7 +972,10 @@ class LaplaceOptimizer(Optimizer):
         # discover a wildly anisotropic geometry. This is where the Laplace
         # covariance pays off a second time.
         warmup = blackjax.window_adaptation(
-            blackjax.nuts, logdensity_v, is_mass_matrix_diagonal=True
+            blackjax.nuts,
+            logdensity_v,
+            is_mass_matrix_diagonal=not self.dense_mass_matrix,
+            max_num_doublings=self.max_num_doublings,
         )
         self.info("NUTS: adapting the step size over %d warm-up steps", self.num_warmup)
         (state, parameters), _ = warmup.run(
@@ -918,33 +986,46 @@ class LaplaceOptimizer(Optimizer):
         self._nuts_parameters = {
             "step_size": float(parameters["step_size"]),
             "inverse_mass_matrix": np.asarray(parameters["inverse_mass_matrix"]).copy(),
+            "max_num_doublings": self.max_num_doublings,
+            "dense_mass_matrix": self.dense_mass_matrix,
         }
-        algorithm = blackjax.nuts(logdensity_v, **parameters)
+        algorithm = blackjax.nuts(
+            logdensity_v, max_num_doublings=self.max_num_doublings, **parameters
+        )
 
         steps_per_chain = max(1, self.num_samples // self.num_chains)
         self.info(
-            "NUTS: %d chains x %d steps, step size %.3g after %d warm-up steps",
+            "NUTS: %d chains x %d steps, step size %.3g after %d warm-up steps, "
+            "at most %d leapfrog steps per draw",
             self.num_chains,
             steps_per_chain,
             self._nuts_parameters["step_size"],
             self.num_warmup,
+            2**self.max_num_doublings,
         )
         chain_keys = jax.random.split(sample_key, self.num_chains)
         step_keys = jax.vmap(lambda k: jax.random.split(k, steps_per_chain))(chain_keys)
 
-        def run_block(states: t.Any, keys: t.Any) -> t.Tuple[t.Any, Array]:
+        def run_block(
+            states: t.Any, keys: t.Any
+        ) -> t.Tuple[t.Any, t.Tuple[Array, Array]]:
             """Advance every chain by ``keys.shape[1]`` steps in one program.
 
             The steps of a block are scanned inside a single compiled call, so
             the block boundary costs a compilation and no python work per step.
+            Besides the positions, the number of leapfrog steps each draw took
+            is returned: that is the count of gradient evaluations, which is
+            what a NUTS draw actually costs.
             """
 
-            def one_chain(current: t.Any, chain_keys: Array) -> t.Tuple[t.Any, Array]:
+            def one_chain(
+                current: t.Any, chain_keys: Array
+            ) -> t.Tuple[t.Any, t.Tuple[Array, Array]]:
                 def one_step(
                     current: t.Any, step_key: Array
-                ) -> t.Tuple[t.Any, Array]:
-                    current, _ = algorithm.step(step_key, current)
-                    return current, current.position
+                ) -> t.Tuple[t.Any, t.Tuple[Array, Array]]:
+                    current, info = algorithm.step(step_key, current)
+                    return current, (current.position, info.num_integration_steps)
 
                 return jax.lax.scan(one_step, current, chain_keys)
 
@@ -970,17 +1051,20 @@ class LaplaceOptimizer(Optimizer):
         probe_calls = 0
         per_step: t.Optional[float] = None
         blocks: t.List[Array] = []
+        leapfrogs = 0
+        warned = False
         done = 0
         started = time.perf_counter()
         while done < steps_per_chain:
             size = min(block, steps_per_chain - done)
             call_started = time.perf_counter()
-            states, block_positions = run_block(
+            states, (block_positions, block_leapfrogs) = run_block(
                 states, step_keys[:, done : done + size]
             )
             # Waiting here is what makes the timing below meaningful; the
             # positions are needed anyway, so it costs nothing extra.
             blocks.append(jax.block_until_ready(block_positions))
+            leapfrogs += int(np.asarray(block_leapfrogs).sum())
             done += size
             call_time = time.perf_counter() - call_started
             if per_step is None:
@@ -995,8 +1079,336 @@ class LaplaceOptimizer(Optimizer):
                     probe,
                     min(steps_per_chain, int(_NUTS_PROGRESS_INTERVAL / per_step)),
                 )
+            per_draw = leapfrogs / (done * self.num_chains)
+            if not warned and per_draw >= 0.95 * 2**self.max_num_doublings:
+                # Nothing here is a tuning detail: the trajectories are being
+                # cut off before they turn, which both biases the draws and
+                # makes every draw cost the worst case.
+                warned = True
+                self.warning(
+                    "NUTS: draws average %.0f leapfrog steps, the ceiling set "
+                    "by max_num_doublings=%d, so trajectories are truncated "
+                    "before they turn around. The step size %.3g is too small "
+                    "for the spread of the posterior; a dense mass matrix or a "
+                    "larger num_warmup would find a better one",
+                    per_draw,
+                    self.max_num_doublings,
+                    self._nuts_parameters["step_size"],
+                )
             self.info(
-                "NUTS: %d/%d steps per chain (%.0f%%), %.0f s elapsed, "
+                "NUTS: %d/%d steps per chain (%.0f%%), %.0f leapfrog steps and "
+                "gradients per draw, %.0f s elapsed, about %.0f s left",
+                done,
+                steps_per_chain,
+                100.0 * done / steps_per_chain,
+                per_draw,
+                time.perf_counter() - started,
+                (steps_per_chain - done) * per_step,
+            )
+        positions_v = jnp.concatenate(blocks, axis=1).reshape(-1, dimension)
+        positions = u_map[None, :] + positions_v @ factor.T
+        theta = transform_of(positions)
+        return np.asarray(theta[:, : self._n_physical]).copy()
+
+    def _run_importance_sampling(
+        self,
+        objective: t.Callable[[Array], Array],
+        u_map: Array,
+        covariance: Array,
+        variance_scale: float,
+        transform_of: t.Callable[[Array], Array],
+    ) -> npt.NDArray[np.float64]:
+        """Draw posterior samples by reweighting a proposal around the mode.
+
+        A draw from a gradient sampler costs a trajectory of model gradients;
+        a draw from a proposal costs one forward pass. When the Laplace
+        Gaussian is close to the posterior, drawing proposals from it and
+        reweighting each by ``posterior / proposal`` therefore gives posterior
+        draws for the price of a few thousand model evaluations instead of a
+        few hundred thousand gradients, and the effective sample size measures
+        how close the Gaussian was: a nearly uniform weight distribution means
+        the Gaussian is the posterior, a collapsed one says it is not and that
+        neither the Laplace errors nor these draws describe it.
+
+        The proposal is a Student-t with four degrees of freedom rather than a
+        Gaussian, because the weights of a Gaussian proposal are unbounded
+        where the posterior has longer tails than the Laplace approximation;
+        the polynomial tails of the t make the ratio decay there whatever the
+        posterior does. In the whitened coordinates the t has unit scale, which
+        gives it twice the Laplace variance.
+
+        Parameters
+        ----------
+        objective:
+            Negative log posterior including the transform Jacobian
+
+        u_map:
+            Location of the mode
+
+        covariance:
+            Covariance of the scaled unconstrained space
+
+        variance_scale:
+            Factor that turns it into the covariance of ``u``
+
+        transform_of:
+            Compiled map from ``u`` to the parameters
+
+        Returns
+        -------
+        :obj:`numpy.ndarray`
+            Posterior draws in parameter space, shape ``(nsamples, nparams)``
+
+        """
+        dimension = u_map.shape[0]
+        covariance_u = covariance * variance_scale
+        factor = jnp.linalg.cholesky(covariance_u)
+        degrees = 4.0
+        num = self.num_samples
+
+        key = jax.random.PRNGKey(0 if self.seed is None else int(self.seed))
+        key, normal_key, chi_key = jax.random.split(key, 3)
+        normal = jax.random.normal(
+            normal_key, (num, dimension), dtype=covariance_u.dtype
+        )
+        chi = jax.random.chisquare(chi_key, degrees, (num,), dtype=covariance_u.dtype)
+        # A t variate is a normal divided by the square root of a chi-square
+        # over its degrees of freedom, which is what makes the tails polynomial.
+        whitened = normal * jnp.sqrt(degrees / chi)[:, None]
+
+        _, logdet = jnp.linalg.slogdet(covariance_u)
+
+        def log_proposal(v: Array) -> Array:
+            """Log density of the proposal at a whitened point."""
+            quadratic = jnp.sum(v * v, axis=-1)
+            return (
+                jax.scipy.special.gammaln(0.5 * (degrees + dimension))
+                - jax.scipy.special.gammaln(0.5 * degrees)
+                - 0.5 * dimension * jnp.log(degrees * jnp.pi)
+                - 0.5 * (degrees + dimension) * jnp.log1p(quadratic / degrees)
+                - 0.5 * logdet
+            )
+
+        def log_weight(v: Array) -> Array:
+            return -objective(u_map + v @ factor.T) - log_proposal(v)
+
+        # The density is evaluated a batch at a time for the same reason the
+        # profile bands are: each draw holds several ``(nlayers, nwn)`` arrays,
+        # and a few thousand of them at once is gigabytes.
+        atmosphere = self.atmosphere
+        per_draw = (
+            atmosphere.wngrid.dtype.itemsize
+            * atmosphere.model.nLayers
+            * atmosphere.wngrid.shape[0]
+            * 2
+        )
+        batch = max(1, _PROFILE_BATCH_BYTES // max(per_draw, 1))
+        log_weights = np.asarray(
+            jax.block_until_ready(jax.lax.map(log_weight, whitened, batch_size=batch))
+        )
+
+        weights = np.exp(log_weights - log_weights.max())
+        total = float(weights.sum())
+        effective = total**2 / float(np.sum(weights**2))
+        self.info(
+            "Importance sampling: %d proposals, effective sample size %.0f "
+            "(%.1f%% of them), largest weight %.3f",
+            num,
+            effective,
+            100.0 * effective / num,
+            float(weights.max()) / total,
+        )
+        if effective < 0.1 * num:
+            self.warning(
+                "Importance sampling is degenerate: the effective sample size "
+                "is %.0f of %d proposals, so these draws carry the information "
+                "of %.0f independent points and the weights are dominated by "
+                "a few of them; the Laplace Gaussian is not a good description "
+                "of this posterior. Raise num_samples, or use sampler='nuts' "
+                "for exact draws at the cost of gradients",
+                effective,
+                num,
+                effective,
+            )
+
+        # Resampling with replacement turns the weighted proposals into the
+        # equal-weight draws the rest of the pipeline expects; the duplication
+        # it introduces is the loss of information the effective sample size
+        # already reports.
+        generator = np.random.default_rng(0 if self.seed is None else int(self.seed))
+        picks = generator.choice(num, size=num, replace=True, p=weights / total)
+        positions = u_map[None, :] + jnp.asarray(np.asarray(whitened)[picks]) @ factor.T
+        theta = transform_of(positions)
+        return np.asarray(theta[:, : self._n_physical]).copy()
+
+    def _run_mclmc(
+        self,
+        objective: t.Callable[[Array], Array],
+        u_map: Array,
+        covariance: Array,
+        variance_scale: float,
+        transform_of: t.Callable[[Array], Array],
+    ) -> npt.NDArray[np.float64]:
+        """Draw posterior samples with Microcanonical Langevin Monte Carlo.
+
+        MCLMC integrates a Hamiltonian flow on a fixed energy shell, with no
+        momentum refreshment and no Metropolis test, so one step costs one
+        gradient and yields one sample, where a NUTS draw spends tens to
+        hundreds of gradients building and probing a trajectory. What it gives
+        up is exactness: the discretisation error is ``O(step_size**2)`` rather
+        than zero, and nothing here corrects it after the fact - blackjax's
+        energy-variance cutoff is off at its default of
+        ``desired_energy_var_max_ratio=inf``, so only steps that produce a NaN
+        are reverted. The step size the tuning settles on is what keeps the
+        energy change per step small, and ``L`` sets how far the flow travels
+        before its momentum is redrawn.
+
+        The Laplace covariance whitens the target, which is what lets one step
+        size and one ``L`` work across directions whose parameter scales differ
+        by orders of magnitude; the tuning therefore only has to find those two
+        numbers and not a preconditioner as well.
+
+        Parameters
+        ----------
+        objective:
+            Negative log posterior including the transform Jacobian
+
+        u_map:
+            Location of the mode
+
+        covariance:
+            Covariance of the scaled unconstrained space
+
+        variance_scale:
+            Factor that turns it into the covariance of ``u``
+
+        transform_of:
+            Compiled map from ``u`` to the parameters
+
+        Returns
+        -------
+        :obj:`numpy.ndarray`
+            Posterior draws in parameter space, shape ``(nsamples, nparams)``
+
+        """
+        import blackjax.mcmc.mclmc as mclmc
+        from blackjax.adaptation.mclmc_adaptation import mclmc_find_L_and_step_size
+
+        dimension = u_map.shape[0]
+        if dimension < 2:
+            raise ValueError(
+                "MCLMC needs at least two fitted parameters, because blackjax "
+                "refuses a one dimensional target; use sampler='nuts' for a "
+                "single parameter"
+            )
+        covariance_u = covariance * variance_scale
+        factor = jnp.linalg.cholesky(covariance_u)
+
+        def logdensity_v(v: Array) -> Array:
+            return -objective(u_map + factor @ v)
+
+        key = jax.random.PRNGKey(0 if self.seed is None else int(self.seed))
+        key, init_key, tune_key, sample_key = jax.random.split(key, 4)
+        steps_per_chain = max(1, self.num_samples // self.num_chains)
+        kernel = mclmc.build_kernel()
+        start = mclmc.init(
+            jnp.zeros(dimension, dtype=covariance_u.dtype), logdensity_v, init_key
+        )
+        # The whitening has already put the posterior close to a standard
+        # normal, so the diagonal preconditioner the tuning would estimate
+        # would come out as the identity; skipping it also skips the extra
+        # tuning steps it costs. The budget is expressed as a fraction of the
+        # sampling run, which is what the routine is calibrated for, with a
+        # floor so that a short run still measures something.
+        self.info(
+            "MCLMC: tuning the step size and trajectory length over about a "
+            "third of %d steps per chain",
+            steps_per_chain,
+        )
+        state, parameters, tuning_steps = mclmc_find_L_and_step_size(
+            mclmc_kernel=kernel,
+            logdensity_fn=logdensity_v,
+            num_steps=max(steps_per_chain, 100),
+            state=start,
+            rng_key=tune_key,
+            diagonal_preconditioning=False,
+        )
+        step_size, length = jax.block_until_ready(
+            (parameters.step_size, parameters.L)
+        )
+        self.info(
+            "MCLMC: step size %.3g and trajectory length %.3g after %d "
+            "tuning steps; %d chains x %d steps, one gradient each",
+            float(step_size),
+            float(length),
+            int(tuning_steps),
+            self.num_chains,
+            steps_per_chain,
+        )
+        sampler = mclmc.as_top_level_api(
+            logdensity_v,
+            L=parameters.L,
+            step_size=parameters.step_size,
+            inverse_mass_matrix=parameters.inverse_mass_matrix,
+        )
+
+        def run_block(states: t.Any, keys: t.Any) -> t.Tuple[t.Any, Array]:
+            """Advance every chain by ``keys.shape[1]`` steps in one program."""
+
+            def one_chain(current: t.Any, chain_keys: Array) -> t.Tuple[t.Any, Array]:
+                def one_step(current: t.Any, step_key: Array) -> t.Tuple[t.Any, Array]:
+                    current, _ = sampler.step(step_key, current)
+                    return current, current.position
+
+                return jax.lax.scan(one_step, current, chain_keys)
+
+            return jax.vmap(one_chain)(states, keys)
+
+        run_block = jax.jit(run_block)
+        # The tuning produced one chain with one momentum. Starting every chain
+        # at the tuned position with its own key gives each an independent
+        # momentum and a recomputed gradient, which costs one gradient per
+        # chain and makes them independent chains instead of four copies of the
+        # same deterministic flow.
+        init_key, step_key = jax.random.split(sample_key)
+        init_keys = jax.random.split(init_key, self.num_chains)
+        states = jax.vmap(lambda x, k: mclmc.init(x, logdensity_v, k))(
+            jnp.broadcast_to(state.position, (self.num_chains, dimension)), init_keys
+        )
+        step_keys = jax.vmap(lambda k: jax.random.split(k, steps_per_chain))(
+            jax.random.split(step_key, self.num_chains)
+        )
+        # Every step costs the same here, so unlike NUTS there is no trajectory
+        # length to discover: the blocks exist only to report progress, and the
+        # size of the first two measures the cost of a step without the
+        # compilation folded in.
+        probe = max(1, steps_per_chain // _NUTS_PROGRESS_PROBE)
+        block = probe
+        probe_calls = 0
+        per_step: t.Optional[float] = None
+        blocks: t.List[Array] = []
+        done = 0
+        started = time.perf_counter()
+        while done < steps_per_chain:
+            size = min(block, steps_per_chain - done)
+            call_started = time.perf_counter()
+            states, block_positions = run_block(
+                states, step_keys[:, done : done + size]
+            )
+            blocks.append(jax.block_until_ready(block_positions))
+            done += size
+            call_time = time.perf_counter() - call_started
+            if per_step is None:
+                probe_calls += 1
+                if probe_calls < 2 and done + probe <= steps_per_chain:
+                    continue
+                per_step = call_time / size
+                block = max(
+                    probe,
+                    min(steps_per_chain, int(_NUTS_PROGRESS_INTERVAL / per_step)),
+                )
+            self.info(
+                "MCLMC: %d/%d steps per chain (%.0f%%), %.0f s elapsed, "
                 "about %.0f s left",
                 done,
                 steps_per_chain,

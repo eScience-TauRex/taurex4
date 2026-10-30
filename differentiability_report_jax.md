@@ -516,6 +516,51 @@ no further change. `covariance` then reports the sample covariance rather than
 the Gaussian one, which is the honest summary when the posterior is not
 Gaussian.
 
+What that costs is worth stating before the option is used. A draw is not one
+likelihood evaluation: it integrates a trajectory of $L$ leapfrog steps, each of
+which is one gradient of the model, so
+
+$$T \approx \frac{\texttt{num\_samples}}{\texttt{num\_chains}} \times \bar L
+\times t_{\text{grad}}$$
+
+with $\bar L$ set by how far the sampler travels before the trajectory turns on
+itself, and $\bar L \le 2^{\texttt{max\_num\_doublings}} = 1024$ at the default.
+On the benchmark above $t_{\text{grad}} = 24$ ms, so 2000 draws at
+$\bar L = 30$ is about 12 min; on an atmosphere whose gradient costs seconds the
+same run is tens of hours, while `laplace` stays at one Hessian plus the L-BFGS
+history and a nested sampler spends $10^4$-$10^5$ forward passes. The progress
+line reports $\bar L$ every five minutes for that reason, and `num_samples` is
+the only knob that changes the total linearly.
+
+`sampler = importance` is the cheap middle ground. It draws proposals from a
+Student-t with four degrees of freedom centred on the mode, with the Laplace
+covariance, evaluates the exact log density at each one and reweights, so the
+cost is one forward pass per proposal and no gradients at all, and it reports
+the effective sample size, which is the measurement of how far the posterior is
+from the Gaussian that the Hessian describes. A proposal equal to the target
+gives constant weights and an effective sample size of $100\%$; a proposal whose
+covariance is wrong by a factor 1.5 keeps $90\%$; a proposal that ignores the
+correlations between three parameters keeps $33\%$ and still reproduces the
+covariance to a few per cent. When it degenerates the log says so, and that is
+the signal to pay for `nuts` instead.
+
+`sampler = mclmc` is the sampler for the case where the posterior is genuinely
+non-Gaussian and the gradient is expensive. Microcanonical Langevin Monte Carlo
+integrates the flow on a fixed energy shell, so **one step costs one gradient
+and yields one sample**: no trajectory, no U-turn, no Metropolis test. What it
+gives up is exactness — the error is $O(\varepsilon^2)$ in the integrator step
+rather than zero, and the tuned step size is the only thing holding it down,
+because blackjax's energy-variance cutoff is disabled at its default of
+`desired_energy_var_max_ratio = inf` — in exchange for removing the factor
+$\bar L$ from the cost above. Each chain is started from the tuned position
+with its own momentum, so the chains are independent rather than copies of the
+same deterministic flow.
+2000 draws is then ~2000 gradients, plus ~30\% for tuning the step size and the
+trajectory length, against $2000 \times \bar L$ for NUTS and $10^4$–$10^5$
+forward passes for nested sampling. The Laplace covariance is used as the
+whitening, so the tuning only has to find two numbers. It needs at least two
+fitted parameters, because blackjax refuses a one-dimensional target.
+
 ### 7. Multi-start, jitter and diagnostics
 
 Three smaller things fall out of having a compiled, differentiable likelihood:
@@ -549,11 +594,13 @@ Three smaller things fall out of having a compiled, differentiable likelihood:
 | `seed`                 | 0          | seed for the draws, so a run is reproducible                                                |
 | `device`               | default    | JAX platform to run on, for example `cpu`                                                   |
 | `sigma_fraction`       | 0.02       | fraction of the draws reused by the fallback numpy post-processing                          |
-| `sampler`              | `laplace`  | `laplace` for the Gaussian description, `nuts` for exact draws                              |
+| `sampler`              | `laplace`  | `laplace` for the Gaussian description, `nuts`/`mclmc` for sampled draws, `importance` for reweighted draws |
 | `n_starts`             | 1          | number of starting points for the mode search                                               |
 | `start_scale`          | 0.5        | logit-space spread of the extra starting points                                             |
 | `num_warmup`           | 500        | NUTS window-adaptation steps                                                                |
 | `num_chains`           | 4          | NUTS chains the draws are split across                                                      |
+| `max_num_doublings`    | 10         | NUTS trajectory cap: at most `2**n` leapfrog steps, and gradients, per draw                  |
+| `dense_mass_matrix`    | False      | adapt a full mass matrix in the NUTS warm-up instead of a diagonal one                       |
 | `jitter`               | False      | fit an extra per-bin noise term                                                             |
 | `jitter_scale`         | mean error | half-normal prior scale of the jitter, in data units                                        |
 
