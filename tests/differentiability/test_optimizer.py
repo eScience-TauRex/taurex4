@@ -216,10 +216,15 @@ def test_solution_stores_the_posterior_samples(optimizer, taurex_model, observat
     for idx, param_name in enumerate(optimizer.fit_names):
         param = values["fit_params"][param_name]
         # The value and the two-sided errors are quantiles of the same draws,
-        # so they have to sit on the median of those draws.
-        assert param["value"] == pytest.approx(
-            np.median(samples[:, idx]), rel=1e-6
-        )
+        # so they have to sit on the median of those draws. The sampler writes
+        # the quantiles with the same weights it reports, which is why the
+        # weighted median is compared against and not numpy's unweighted one.
+        from taurex.util import quantile_corner
+
+        expected = quantile_corner(
+            samples[:, idx], [0.5], weights=values["weights"]
+        )[0]
+        assert param["value"] == pytest.approx(expected, rel=1e-12)
         assert param["sigma_m"] > 0.0
         assert param["sigma_p"] > 0.0
         assert param["trace"].shape == (optimizer.num_samples,)
@@ -500,3 +505,176 @@ def test_fisher_sigma_matches_the_laplace_sigma(taurex_model, observation):
     fisher_sigma = 1.0 / np.sqrt(np.diag(fisher))
     sample_sigma = optimizer.get_samples(0).std(axis=0)
     np.testing.assert_allclose(fisher_sigma, sample_sigma, rtol=0.5)
+
+
+def test_unknown_sampler_is_rejected():
+    """A misspelt sampler is an error rather than a silent Laplace fit."""
+    with pytest.raises(ValueError, match="Unknown sampler"):
+        LaplaceOptimizer(sampler="hmc")
+
+
+def test_smc_sampler_is_read_from_the_input_file():
+    """The input file can select SMC and its particle count."""
+    from taurex.parameter.factory import create_optimizer
+
+    optimizer = create_optimizer(
+        {"optimizer": "laplace", "sampler": "smc", "num_samples": 32}
+    )
+
+    assert isinstance(optimizer, LaplaceOptimizer)
+    assert optimizer.sampler == "smc"
+    assert optimizer.num_particles == 32
+
+
+def test_smc_recovers_a_one_parameter_posterior(taurex_model, observation):
+    """Tempered SMC returns weighted draws around the injected parameter."""
+    optimizer = LaplaceOptimizer(
+        num_samples=200,
+        max_iterations=100,
+        sampler="smc",
+        num_mcmc_steps=2,
+        smc_max_delta=0.2,
+        max_num_doublings=4,
+        seed=11,
+    )
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    optimizer.enable_fit("planet_radius")
+
+    truth = np.array([1.07])
+    optimizer.update_model(truth)
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    clean = np.asarray(atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64)))
+    generator = np.random.default_rng(5)
+    observation._obs_spectrum[:, 1] = clean + generator.normal(0.0, 1e-4, clean.shape)
+    optimizer.update_model(truth)
+    optimizer.compute_fit()
+
+    samples = optimizer.get_samples(0)
+    weights = optimizer.get_weights(0)
+    assert samples.shape == (optimizer.num_particles, 1)
+    assert weights.shape == (optimizer.num_particles,)
+    assert float(weights.sum()) == pytest.approx(1.0)
+    assert np.all(np.isfinite(samples))
+
+    mean = float(np.sum(weights * samples[:, 0]))
+    sigma = float(np.sqrt(np.sum(weights * (samples[:, 0] - mean) ** 2)))
+    assert sigma > 0.0
+    # The injected value sits within a few posterior sigma of the weighted
+    # median, and the median is what the retrieval reports.
+    assert abs(optimizer._median[0] - truth[0]) / sigma < 4.0
+    assert optimizer.log_evidence is not None
+    assert np.isfinite(optimizer.log_evidence)
+    assert optimizer.log_evidence_error >= 0.0
+
+
+def test_smc_evidence_is_the_likelihood_of_a_flat_target(taurex_model, observation):
+    """With a constant likelihood the evidence is just that constant.
+
+    The errors are made a million times larger than the variation of the
+    spectrum, so the likelihood is flat over the prior and ``log Z`` has to
+    equal the log likelihood at any point. This checks the normalisation of
+    the likelihood and the accumulation of the tempering increments together.
+    """
+    optimizer = LaplaceOptimizer(
+        num_samples=64,
+        max_iterations=30,
+        sampler="smc",
+        num_mcmc_steps=2,
+        smc_max_delta=0.5,
+        max_num_doublings=3,
+        seed=13,
+    )
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    optimizer.enable_fit("planet_radius")
+
+    optimizer.update_model(np.array([1.07]))
+    # Overwrite the observation's error with one that dwarfs the model.
+    observation._obs_spectrum[:, 2] = 1e6
+    optimizer.compute_fit()
+
+    expected = float(
+        optimizer.atmosphere.log_likelihood(
+            jnp.asarray(optimizer._map, dtype=jnp.float64)
+        )
+    )
+    assert optimizer.log_evidence == pytest.approx(expected, abs=1e-3)
+
+
+def test_smc_handles_a_fitted_jitter(taurex_model, observation):
+    """The extra jitter coordinate is drawn from its prior and carried through."""
+    optimizer = LaplaceOptimizer(
+        num_samples=96,
+        max_iterations=100,
+        sampler="smc",
+        num_mcmc_steps=1,
+        smc_max_delta=0.25,
+        max_num_doublings=3,
+        jitter=True,
+        seed=19,
+    )
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    for name in NAMES:
+        optimizer.enable_fit(name)
+
+    truth = np.array([1.05, 950.0, np.log10(3e-4)])
+    optimizer.update_model(truth)
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    clean = np.asarray(atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64)))
+    generator = np.random.default_rng(8)
+    observation._obs_spectrum[:, 1] = clean + generator.normal(0.0, 5e-5, clean.shape)
+    observation._obs_spectrum[:, 2] = 1e-5
+    optimizer.update_model(truth)
+    optimizer.compute_fit()
+
+    assert optimizer.jitter_map is not None
+    samples = optimizer.get_samples(0)
+    assert samples.shape == (optimizer.num_particles, len(NAMES))
+    assert np.all(np.isfinite(samples))
+    assert optimizer.log_evidence is not None
+    assert np.isfinite(optimizer.log_evidence)
+
+
+def test_smc_draws_weighted_quantiles_and_bands(taurex_model, observation):
+    """The solution interface carries the SMC weights through to the output."""
+    optimizer = LaplaceOptimizer(
+        num_samples=64,
+        max_iterations=30,
+        sampler="smc",
+        num_mcmc_steps=2,
+        smc_max_delta=0.5,
+        max_num_doublings=3,
+        seed=17,
+    )
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    optimizer.enable_fit("planet_radius")
+
+    optimizer.update_model(np.array([1.07]))
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    clean = np.asarray(atmosphere.spectrum(jnp.asarray([1.07], dtype=jnp.float64)))
+    observation._obs_spectrum[:, 1] = clean
+    optimizer.update_model(np.array([1.07]))
+    optimizer.compute_fit()
+
+    _, _, _, extra = next(optimizer.get_solution())
+    values = dict(extra)
+    np.testing.assert_allclose(values["weights"], optimizer.get_weights(0))
+
+    profiles, spectra = optimizer.generate_profiles(0, observation.wavenumberGrid)
+    assert np.all(np.isfinite(profiles["temp_profile_std"]))
+    assert np.all(spectra["binned_std"] >= 0.0)
+
+    solution = optimizer.generate_solution()
+    assert solution["GlobalStats"]["global evidence"] == pytest.approx(
+        optimizer.log_evidence
+    )
+

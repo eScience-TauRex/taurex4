@@ -38,6 +38,7 @@ import numpy as np
 import numpy.typing as npt
 import optax
 
+from taurex import OutputSize
 from taurex.core.priors import Gaussian
 from taurex.core.priors import Prior
 from taurex.core.priors import Uniform
@@ -62,6 +63,15 @@ _NUTS_PROGRESS_INTERVAL = 300.0
 
 _NUTS_PROGRESS_PROBE = 100
 """Length of the measuring block as a fraction ``1/n`` of the run."""
+
+_SMC_BATCH_BYTES = 64 * 1024 * 1024
+"""Working set one batched SMC particle update is allowed to use."""
+
+_SMC_ARRAYS_PER_PARTICLE = 12
+"""Roughly how many ``(nlayers, nwn)`` arrays one particle keeps live."""
+
+_SMC_TARGET_ACCEPT = 0.8
+"""NUTS acceptance rate the step size of the SMC inner kernel aims for."""
 
 
 def _as_bool(value: t.Any) -> bool:
@@ -92,6 +102,9 @@ _BROADCAST_FIT_FIELDS = (
     "_fisher",
     "_jitter_map",
     "_n_physical",
+    "_weights",
+    "_log_evidence",
+    "_log_evidence_error",
     "_nuts_parameters",
     "iterations",
     "function_evaluations",
@@ -290,6 +303,12 @@ class LaplaceOptimizer(Optimizer):
         num_chains: t.Optional[int] = 4,
         max_num_doublings: t.Optional[int] = 10,
         dense_mass_matrix: t.Optional[bool] = False,
+        num_particles: t.Optional[int] = None,
+        num_mcmc_steps: t.Optional[int] = 5,
+        smc_target_ess: t.Optional[float] = 0.5,
+        smc_max_delta: t.Optional[float] = 0.1,
+        smc_max_steps: t.Optional[int] = 200,
+        smc_step_size: t.Optional[float] = 0.1,
         jitter: t.Optional[bool] = False,
         jitter_scale: t.Optional[float] = None,
         **kwargs: t.Any,
@@ -375,6 +394,22 @@ class LaplaceOptimizer(Optimizer):
             accept/reject and no trajectory length. It is the option to use
             when the posterior is genuinely non-Gaussian and the gradient is
             too expensive for NUTS; it needs at least two fitted parameters.
+            Every chain starts at the mode found by the fit, so the draws
+            describe the basin around that mode and nothing else: agreement
+            between its chains is not evidence that another region of the
+            prior does not carry posterior mass, and a nested sampler is the
+            only one of these that can answer that.
+            ``smc`` runs adaptive tempered Sequential Monte Carlo with a NUTS
+            kernel, the particle filter version of the same gradient sampler.
+            Unlike the chain samplers it starts from the prior, so a posterior
+            that is not confined to the basin of the mode is reachable, and it
+            accumulates the Bayesian evidence alongside the draws: the sum of
+            the per-stage log normalising constants is ``log Z``. The price is
+            that it needs many more forward passes than a single chain, since
+            every tempering stage moves every particle with
+            ``num_mcmc_steps`` NUTS transitions. Use it when the evidence is
+            wanted and a nested sampler is too slow on the differentiable
+            model. It requires ``blackjax >= 1.7``.
 
         n_starts:
             Number of independent starting points for the mode search. Each
@@ -419,6 +454,46 @@ class LaplaceOptimizer(Optimizer):
             fitted parameters to estimate the matrix, and it changes nothing
             when the Laplace whitening was already accurate.
 
+        num_particles:
+            Number of particles the ``smc`` sampler carries. It defaults to
+            ``num_samples``, so the number of posterior draws is set the same
+            way as for the other samplers. The Monte Carlo error of both the
+            evidence and the draws falls as one over its square root.
+
+        num_mcmc_steps:
+            NUTS transitions applied to every particle in every tempering
+            stage of the ``smc`` sampler. One stage reweights the particles
+            for a small increase in the tempering parameter and then moves
+            them, and the transitions are what keep the particles from
+            collapsing onto the few that carried the first stage's weight.
+
+        smc_target_ess:
+            Fraction of the particles the ``smc`` tempering schedule keeps
+            effective at the end of a stage. The next tempering increment is
+            the largest one that leaves this fraction of the particles
+            effective; a smaller value takes fewer, larger stages and a larger
+            value takes more, smaller ones.
+
+        smc_max_delta:
+            Largest increase of the tempering parameter in one ``smc`` stage.
+            Without a cap, a weak likelihood can stay above the target
+            effective sample size at the full increment, in which case the
+            schedule asks for no intermediate stages and the particles are
+            moved by only one round of transitions. The cap forces at least
+            ``ceil(1 / smc_max_delta)`` stages.
+
+        smc_max_steps:
+            Maximum number of tempering stages. Reaching it before the
+            tempering parameter is one means the run stopped on a tempered
+            target: the draws and the evidence would then describe that
+            target, not the posterior, and the run says so.
+
+        smc_step_size:
+            Initial NUTS step size of the ``smc`` inner kernel, in the
+            unconstrained coordinates where the prior particles are of order
+            one. It is adapted between stages from the NUTS acceptance rate,
+            so this only sets where the adaptation starts.
+
         jitter:
             When True an extra nuisance coordinate is fitted: the per-bin
             errors become ``sqrt(error^2 + jitter^2)``. This is how a
@@ -452,10 +527,10 @@ class LaplaceOptimizer(Optimizer):
         self.ignored_options = kwargs
 
         self.sampler = str(sampler).lower()
-        if self.sampler not in ("laplace", "nuts", "importance", "mclmc"):
+        if self.sampler not in ("laplace", "nuts", "importance", "mclmc", "smc"):
             raise ValueError(
                 f"Unknown sampler {sampler!r}; use 'laplace', 'nuts', "
-                "'importance' or 'mclmc'"
+                "'importance', 'mclmc' or 'smc'"
             )
         self.n_starts = max(1, int(n_starts))
         self.start_scale = float(start_scale)
@@ -463,6 +538,31 @@ class LaplaceOptimizer(Optimizer):
         self.num_chains = max(1, int(num_chains))
         self.max_num_doublings = int(max_num_doublings)
         self.dense_mass_matrix = _as_bool(dense_mass_matrix)
+        self.num_particles = int(
+            self.num_samples if num_particles is None else num_particles
+        )
+        if self.num_particles < 2:
+            raise ValueError(
+                "SMC needs at least two particles for the tempering to have an "
+                "effective sample size to work with"
+            )
+        self.num_mcmc_steps = max(1, int(num_mcmc_steps))
+        self.smc_target_ess = float(smc_target_ess)
+        if not 0.0 < self.smc_target_ess <= 1.0:
+            raise ValueError(
+                f"smc_target_ess must lie in (0, 1], not {smc_target_ess!r}"
+            )
+        self.smc_max_delta = float(smc_max_delta)
+        if not 0.0 < self.smc_max_delta <= 1.0:
+            raise ValueError(
+                f"smc_max_delta must lie in (0, 1], not {smc_max_delta!r}"
+            )
+        self.smc_max_steps = max(1, int(smc_max_steps))
+        self.smc_step_size = float(smc_step_size)
+        if self.smc_step_size <= 0.0:
+            raise ValueError(
+                f"smc_step_size must be positive, not {smc_step_size!r}"
+            )
         self.jitter = _as_bool(jitter)
         self.jitter_scale = None if jitter_scale is None else float(jitter_scale)
 
@@ -478,6 +578,9 @@ class LaplaceOptimizer(Optimizer):
         self._fisher: t.Optional[npt.NDArray[np.float64]] = None
         self._jitter_map: t.Optional[float] = None
         self._n_physical: int = 0
+        self._weights: t.Optional[npt.NDArray[np.float64]] = None
+        self._log_evidence: t.Optional[float] = None
+        self._log_evidence_error: t.Optional[float] = None
         self._nuts_parameters: t.Optional[t.Dict[str, t.Any]] = None
 
         self.iterations: t.Optional[int] = None
@@ -531,6 +634,12 @@ class LaplaceOptimizer(Optimizer):
                 "No fitting parameters were enabled, so there is nothing to "
                 "fit. Add entries under [Fitting] in the input file."
             )
+
+        # A second fit on the same object must not inherit the weights or the
+        # evidence of the first one, which a different sampler may not set.
+        self._weights = None
+        self._log_evidence = None
+        self._log_evidence_error = None
 
         dtype = jnp.float64
         atmosphere = Atmosphere(
@@ -631,6 +740,39 @@ class LaplaceOptimizer(Optimizer):
             towards the bounds and removes the slope the tails need.
             """
             return objective(u) - log_transform_jacobian(u)
+
+        def log_likelihood_u(u: Array) -> Array:
+            """Log likelihood at an unconstrained vector.
+
+            Tempered SMC needs the likelihood on its own, because the tempering
+            exponent multiplies it and leaves the prior alone; the concatenation
+            of this and :func:`log_prior_u` is :func:`nuts_objective`.
+            """
+            theta = parameters_of(u)
+            physical = theta[..., : self._n_physical]
+            if jitter:
+                size = theta[..., len(transforms)]
+                error_here = jnp.sqrt(error**2 + size**2)
+            else:
+                error_here = error
+            return atmosphere.log_likelihood(physical, data=data, error=error_here)
+
+        def log_prior_u(u: Array) -> Array:
+            """Log prior density in unconstrained space, Jacobian included.
+
+            The density of ``u`` is the parameter prior times
+            ``|d theta / d u|``, which is the distribution a tempered SMC
+            starts from before any likelihood is applied.
+            """
+            theta = parameters_of(u)
+            log_prior = sum(
+                transform.log_prior(theta[..., index])
+                for index, transform in enumerate(transforms)
+            )
+            if jitter:
+                size = theta[..., len(transforms)]
+                log_prior = log_prior - 0.5 * (size / self.jitter_scale) ** 2
+            return log_prior + log_transform_jacobian(u)
 
         u = self._starting_point(transforms, dtype)
         if jitter:
@@ -838,49 +980,100 @@ class LaplaceOptimizer(Optimizer):
         self._log_posterior = -float(score)
 
         started = time.perf_counter()
-        if self.sampler != "laplace":
-            # The mass matrix has to describe the same density the sampler
-            # targets, so the Hessian here includes the transform Jacobian.
-            nuts_hessian_of = jax.jit(jax.hessian(nuts_objective), device=self.device)
-            covariance, variance_scale = self._laplace_covariance(
-                nuts_hessian_of, u_map
+        if self.sampler == "smc":
+            # Tempered SMC starts from the prior, which the logit transform
+            # already puts at order one in every coordinate, so the Laplace
+            # covariance is neither needed as a mass matrix nor accurate away
+            # from the mode: whitening by it would just rescale the prior.
+            self._u_covariance = None
+            self._samples, self._weights = self._run_smc(
+                log_prior_u,
+                log_likelihood_u,
+                transform_of,
+                u_map.shape[0],
             )
-        else:
-            covariance, variance_scale = self._laplace_covariance(hessian_of, u_map)
-        self._u_covariance = covariance * variance_scale
-        if self.sampler != "laplace":
-            if self.sampler == "nuts":
-                self._samples = self._run_nuts(
-                    nuts_objective, u_map, covariance, variance_scale, transform_of
+            self._median = np.array(
+                [
+                    quantile_corner(
+                        self._samples[:, index], [0.5], weights=self._weights
+                    )[0]
+                    for index in range(self._n_physical)
+                ]
+            )
+            if np.count_nonzero(self._weights) > 1:
+                self._covariance = np.atleast_2d(
+                    np.cov(self._samples, rowvar=False, aweights=self._weights)
                 )
-            elif self.sampler == "importance":
-                self._samples = self._run_importance_sampling(
-                    nuts_objective, u_map, covariance, variance_scale, transform_of
-                )
-            else:
-                self._samples = self._run_mclmc(
-                    nuts_objective, u_map, covariance, variance_scale, transform_of
-                )
-            self._median = np.median(self._samples, axis=0)
-            if self._samples.shape[0] > 1:
-                self._covariance = np.atleast_2d(np.cov(self._samples, rowvar=False))
             else:
                 self._covariance = np.zeros(
                     (self._n_physical, self._n_physical), dtype=float
                 )
         else:
-            draws_full = self._draw_samples(
-                u_map, covariance, variance_scale, transform_of
-            )
-            draws_full = np.asarray(draws_full)
-            self._samples = draws_full[:, : self._n_physical].copy()
-            self._median = np.median(self._samples, axis=0)
-            full_covariance = self._parameter_covariance(
-                covariance, variance_scale, jacobian_of, u_map
-            )
-            self._covariance = np.asarray(full_covariance)[
-                : self._n_physical, : self._n_physical
-            ].copy()
+            if self.sampler != "laplace":
+                # The mass matrix has to describe the same density the sampler
+                # targets, so the Hessian here includes the transform Jacobian.
+                nuts_hessian_of = jax.jit(
+                    jax.hessian(nuts_objective), device=self.device
+                )
+                covariance, variance_scale = self._laplace_covariance(
+                    nuts_hessian_of, u_map
+                )
+            else:
+                covariance, variance_scale = self._laplace_covariance(
+                    hessian_of, u_map
+                )
+            self._u_covariance = covariance * variance_scale
+            if self.sampler != "laplace":
+                if self.sampler == "nuts":
+                    self._samples = self._run_nuts(
+                        nuts_objective,
+                        u_map,
+                        covariance,
+                        variance_scale,
+                        transform_of,
+                    )
+                elif self.sampler == "importance":
+                    self._samples = self._run_importance_sampling(
+                        nuts_objective,
+                        u_map,
+                        covariance,
+                        variance_scale,
+                        transform_of,
+                    )
+                else:
+                    self._samples = self._run_mclmc(
+                        nuts_objective,
+                        u_map,
+                        covariance,
+                        variance_scale,
+                        transform_of,
+                    )
+                # These samplers produce independent draws, so the weights are
+                # uniform and are reported as such.
+                self._weights = None
+                self._median = np.median(self._samples, axis=0)
+                if self._samples.shape[0] > 1:
+                    self._covariance = np.atleast_2d(
+                        np.cov(self._samples, rowvar=False)
+                    )
+                else:
+                    self._covariance = np.zeros(
+                        (self._n_physical, self._n_physical), dtype=float
+                    )
+            else:
+                draws_full = self._draw_samples(
+                    u_map, covariance, variance_scale, transform_of
+                )
+                draws_full = np.asarray(draws_full)
+                self._samples = draws_full[:, : self._n_physical].copy()
+                self._weights = None
+                self._median = np.median(self._samples, axis=0)
+                full_covariance = self._parameter_covariance(
+                    covariance, variance_scale, jacobian_of, u_map
+                )
+                self._covariance = np.asarray(full_covariance)[
+                    : self._n_physical, : self._n_physical
+                ].copy()
         self.laplace_time = time.perf_counter() - started
 
         if nprocs() > 1:
@@ -905,6 +1098,296 @@ class LaplaceOptimizer(Optimizer):
         payload = broadcast(None)
         for name, value in payload.items():
             setattr(self, name, value)
+
+    def _run_smc(
+        self,
+        log_prior_fn: t.Callable[[Array], Array],
+        log_likelihood_fn: t.Callable[[Array], Array],
+        transform_of: t.Callable[[Array], Array],
+        dimension: int,
+    ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        """Draw posterior samples and the evidence with tempered SMC.
+
+        Sequential Monte Carlo starts from a set of particles drawn from the
+        prior and turns them into samples of
+
+        .. math::
+
+            \\pi_\\beta(u) \\propto p(u) \\, L(u)^\\beta
+
+        by raising :math:`\\beta` from zero to one. Each stage chooses the
+        largest increase of :math:`\\beta` that leaves ``smc_target_ess`` of
+        the particles effective, reweights them by the likelihood increment,
+        resamples and then moves every particle with ``num_mcmc_steps`` NUTS
+        transitions. The product of the stage normalising constants is the
+        evidence, so a run returns ``log Z`` as well as the posterior draws.
+
+        Starting from the prior is what separates this from the chain samplers:
+        a second mode that the mode search never reached still gets its share
+        of the particles, and the evidence is the one the prior defines. The
+        prior in ``u`` is ``p(theta) |d theta / d u|``, which
+        :func:`log_prior_u` provides, and the logit transform keeps it of
+        order one in every coordinate so the inner kernel needs no whitening.
+
+        Parameters
+        ----------
+        log_prior_fn:
+            Log prior density in unconstrained space, Jacobian included
+
+        log_likelihood_fn:
+            Log likelihood of one unconstrained vector
+
+        transform_of:
+            Compiled map from ``u`` to the parameters
+
+        dimension:
+            Number of unconstrained coordinates, jitter included when fitted
+
+        Returns
+        -------
+        samples, weights:
+            Posterior draws in parameter space with shape
+            ``(num_particles, nparams)`` and their normalised weights
+
+        """
+        from blackjax.mcmc import nuts as nuts_kernel
+        from blackjax.smc import base as smc_base
+        from blackjax.smc import ess as smc_ess
+        from blackjax.smc import solver as smc_solver
+        from blackjax.smc import tempered as smc_tempered
+        from blackjax.smc.resampling import systematic
+
+        dtype = jnp.float64
+        particles_count = self.num_particles
+
+        key = jax.random.PRNGKey(0 if self.seed is None else int(self.seed))
+        key, init_key, jitter_key = jax.random.split(key, 3)
+
+        # A uniform cube pushed through the prior transform is a prior draw for
+        # every prior type the transforms support; for the jitter the prior is
+        # half normal on the size, so a standard normal magnitude is exact.
+        # The cube is kept just inside its edges because the logit is infinite
+        # there.
+        cube = jax.random.uniform(
+            init_key,
+            (particles_count, dimension),
+            dtype=dtype,
+            minval=1e-6,
+            maxval=1.0 - 1e-6,
+        )
+        particles = jax.scipy.special.logit(cube)
+        if self.jitter:
+            magnitude = jnp.abs(
+                jax.random.normal(jitter_key, (particles_count,), dtype=dtype)
+            )
+            particles = particles.at[:, dimension - 1].set(
+                jnp.log(jnp.clip(magnitude, 1e-6, None))
+            )
+
+        # Batching the particle axis keeps the working set bounded: a NUTS
+        # trajectory holds several ``(nlayers, nwn)`` arrays per particle, and
+        # an atmosphere of a thousand layers times a thousand wavenumbers is
+        # megabytes per array.
+        atmosphere = self.atmosphere
+        per_particle = (
+            atmosphere.wngrid.dtype.itemsize
+            * atmosphere.model.nLayers
+            * atmosphere.wngrid.shape[0]
+            * _SMC_ARRAYS_PER_PARTICLE
+        )
+        batch = max(1, _SMC_BATCH_BYTES // max(per_particle, 1))
+        batch = min(batch, particles_count)
+
+        # The inner kernel is NUTS in the unconstrained coordinates. The mass
+        # matrix is the identity: the coordinates are already the ones the
+        # prior and the mode search work in, and the step size is what carries
+        # the local scale of the target. ``max_num_doublings`` builds arrays of
+        # a fixed size inside the kernel, so it has to stay a python constant
+        # rather than join the traced parameters that SMC updates per stage.
+        raw_kernel = nuts_kernel.build_kernel()
+
+        def mcmc_step_fn(
+            stage_key: Array,
+            state: t.Any,
+            logdensity_fn: t.Callable[[Array], Array],
+            step_size: Array,
+            inverse_mass_matrix: Array,
+        ) -> t.Tuple[t.Any, t.Any]:
+            """One NUTS transition with the particle-wide metric.
+
+            Returns
+            -------
+            :obj:`tuple`
+                The new HMC state and the NUTS transition information
+
+            """
+            return raw_kernel(
+                stage_key,
+                state,
+                logdensity_fn,
+                step_size,
+                inverse_mass_matrix,
+                self.max_num_doublings,
+            )
+
+        mcmc_init_fn = nuts_kernel.init
+        smc_kernel = smc_tempered.build_kernel(
+            log_prior_fn,
+            log_likelihood_fn,
+            mcmc_step_fn,
+            mcmc_init_fn,
+            systematic,
+            batch_size=batch,
+        )
+        batched_likelihood = smc_base.map_fn(log_likelihood_fn, batch)
+        # ``ess_solver`` multiplies this by the particle count, so it is the
+        # fraction of the particles that must stay effective, not a count.
+        target_ess = self.smc_target_ess
+        metric = jnp.ones((1, dimension), dtype=dtype)
+
+        def one_stage(
+            stage_key: Array,
+            state: t.Any,
+            step_size: Array,
+            remaining: Array,
+        ) -> t.Tuple[t.Any, t.Any]:
+            """Advance the particles by one adaptive tempering stage."""
+            delta = smc_ess.ess_solver(
+                batched_likelihood,
+                state.particles,
+                target_ess,
+                remaining,
+                smc_solver.dichotomy,
+            )
+            delta = jnp.clip(delta, 0.0, remaining)
+            parameters = {
+                "step_size": step_size,
+                "inverse_mass_matrix": metric,
+            }
+            return smc_kernel(
+                stage_key,
+                state,
+                self.num_mcmc_steps,
+                state.tempering_param + delta,
+                parameters,
+            )
+
+        one_stage = jax.jit(one_stage, device=self.device)
+
+        state = smc_tempered.init(particles)
+        # Dual averaging on the log step size, as in the NUTS window
+        # adaptation, but driven by the acceptance rate of the stage that just
+        # finished. The tempering parameter changes between stages, so the
+        # step size has to follow the narrowing target rather than be tuned
+        # once.
+        log_step = np.log(self.smc_step_size)
+        log_step_bar = log_step
+        h_bar = 0.0
+        mu = np.log(10.0 * self.smc_step_size)
+        t0, gamma = 10.0, 0.05
+
+        log_evidence = 0.0
+        log_evidence_variance = 0.0
+        beta = 0.0
+        stage = 0
+        accepted = 0.0
+        ess_value = float(particles_count)
+        started = time.perf_counter()
+        self.info(
+            "SMC: %d particles from the prior, %d NUTS steps each per stage, "
+            "target ESS %.0f%%",
+            particles_count,
+            self.num_mcmc_steps,
+            100.0 * self.smc_target_ess,
+        )
+        while beta < 1.0 and stage < self.smc_max_steps:
+            stage += 1
+            key, stage_key = jax.random.split(key)
+            # The ESS solver is allowed to ask for at most this much of the
+            # remaining temperature range. Capping the increment is what keeps
+            # a weak likelihood from jumping straight to beta = 1 after one
+            # round of transitions.
+            remaining = jnp.asarray(
+                min(self.smc_max_delta, 1.0 - beta), dtype=dtype
+            )
+            step_size = jnp.asarray([np.exp(log_step)], dtype=dtype)
+            state, info = one_stage(stage_key, state, step_size, remaining)
+            # Waiting here makes the timings meaningful and the numbers below
+            # readable; the state is needed by the next stage anyway.
+            state, info = jax.block_until_ready((state, info))
+
+            beta = float(state.tempering_param)
+            increment = float(info.log_likelihood_increment)
+            log_evidence += increment
+
+            # The normalising constant of a stage is estimated from N weighted
+            # particles, so its relative variance is (N / ESS - 1) / N. The
+            # stage estimates multiply, which adds their log variances.
+            ess_value = 1.0 / float(jnp.sum(state.weights**2))
+            log_evidence_variance += max(
+                particles_count / max(ess_value, 1.0) - 1.0, 0.0
+            ) / particles_count
+
+            acceptance = info.update_info.acceptance_rate
+            accepted = float(jnp.mean(acceptance))
+
+            step_number = float(stage)
+            eta = 1.0 / (step_number + t0)
+            h_bar = (1.0 - eta) * h_bar + eta * (_SMC_TARGET_ACCEPT - accepted)
+            log_step = mu - np.sqrt(step_number) / gamma * h_bar
+            log_step_bar = (
+                1.0 - 1.0 / step_number
+            ) * log_step_bar + (1.0 / step_number) * log_step
+            log_step = float(
+                np.clip(min(log_step, log_step_bar), np.log(1e-8), np.log(1e2))
+            )
+
+            self.info(
+                "SMC: stage %d, tempering %.4f, ESS %.0f/%d, acceptance %.2f, "
+                "step size %.3g, log Z %.3f, %.0f s elapsed",
+                stage,
+                beta,
+                ess_value,
+                particles_count,
+                accepted,
+                float(np.exp(log_step)),
+                log_evidence,
+                time.perf_counter() - started,
+            )
+
+        if beta < 1.0:
+            self.warning(
+                "SMC stopped after %d stages with the tempering parameter at "
+                "%.4f instead of 1, so these particles and log Z %.3f "
+                "describe the tempered target, not the posterior. Raise "
+                "smc_max_steps or the particle count",
+                stage,
+                beta,
+                log_evidence,
+            )
+
+        self._log_evidence = log_evidence
+        self._log_evidence_error = float(np.sqrt(log_evidence_variance))
+        weights = np.asarray(state.weights, dtype=float)
+        weights = weights / weights.sum()
+
+        # The particles carry the final weights; the transform is applied to
+        # all of them in one call, and the weights are returned alongside them
+        # rather than resampling away the information the SMC already has.
+        theta = transform_of(state.particles)
+        samples = np.asarray(theta[:, : self._n_physical]).copy()
+        self.info(
+            "SMC: finished after %d stages in %.0f s, log Z = %.3f +/- %.3f, "
+            "final ESS %.0f/%d (%.1f%%)",
+            stage,
+            time.perf_counter() - started,
+            log_evidence,
+            self._log_evidence_error,
+            ess_value,
+            particles_count,
+            100.0 * ess_value / particles_count,
+        )
+        return samples, weights
 
     def _run_nuts(
         self,
@@ -994,7 +1477,16 @@ class LaplaceOptimizer(Optimizer):
             "dense_mass_matrix": self.dense_mass_matrix,
         }
         algorithm = blackjax.nuts(
-            logdensity_v, max_num_doublings=self.max_num_doublings, **parameters
+            logdensity_v,
+            # The window adaptation returns every algorithm parameter,
+            # including the trajectory budget it was given, so it has to be
+            # filtered out before being passed alongside the explicit one.
+            **{
+                name: value
+                for name, value in parameters.items()
+                if name != "max_num_doublings"
+            },
+            max_num_doublings=self.max_num_doublings,
         )
 
         steps_per_chain = max(1, self.num_samples // self.num_chains)
@@ -1318,15 +1810,19 @@ class LaplaceOptimizer(Optimizer):
         start = mclmc.init(
             jnp.zeros(dimension, dtype=covariance_u.dtype), logdensity_v, init_key
         )
-        # The whitening has already put the posterior close to a standard
-        # normal, so the diagonal preconditioner the tuning would estimate
-        # would come out as the identity; skipping it also skips the extra
-        # tuning steps it costs. The budget is expressed as a fraction of the
-        # sampling run, which is what the routine is calibrated for, with a
-        # floor so that a short run still measures something.
+        # The whitening is only as accurate as the Hessian it came from, and a
+        # covariance that is wrong by a large factor in some direction leaves
+        # the whitened target anisotropic: one step size then has to serve the
+        # narrowest and the widest direction at once, and a chain of a few
+        # hundred steps covers only the narrow ones - the draws collapse around
+        # the mode and look like the Laplace Gaussian they were supposed to
+        # correct. The diagonal preconditioner costs about a quarter more tuning
+        # steps and measures that residual variance from the tuning draws,
+        # which makes the geometry isotropic again whatever the whitening got
+        # wrong.
         self.info(
-            "MCLMC: tuning the step size and trajectory length over about a "
-            "third of %d steps per chain",
+            "MCLMC: tuning the step size, trajectory length and diagonal "
+            "preconditioner over about a third of %d steps per chain",
             steps_per_chain,
         )
         state, parameters, tuning_steps = mclmc_find_L_and_step_size(
@@ -1335,7 +1831,7 @@ class LaplaceOptimizer(Optimizer):
             num_steps=max(steps_per_chain, 100),
             state=start,
             rng_key=tune_key,
-            diagonal_preconditioning=False,
+            diagonal_preconditioning=True,
         )
         step_size, length = jax.block_until_ready(
             (parameters.step_size, parameters.L)
@@ -1356,13 +1852,25 @@ class LaplaceOptimizer(Optimizer):
             inverse_mass_matrix=parameters.inverse_mass_matrix,
         )
 
-        def run_block(states: t.Any, keys: t.Any) -> t.Tuple[t.Any, Array]:
-            """Advance every chain by ``keys.shape[1]`` steps in one program."""
+        def run_block(
+            states: t.Any, keys: t.Any
+        ) -> t.Tuple[t.Any, t.Tuple[Array, Array]]:
+            """Advance every chain by ``keys.shape[1]`` steps in one program.
 
-            def one_chain(current: t.Any, chain_keys: Array) -> t.Tuple[t.Any, Array]:
-                def one_step(current: t.Any, step_key: Array) -> t.Tuple[t.Any, Array]:
-                    current, _ = sampler.step(step_key, current)
-                    return current, current.position
+            Besides the positions, whether each step was clean is returned: a
+            step that produced a NaN is reverted by the kernel, so a chain whose
+            steps are all reverted stays where it started and its draws are a
+            spike at the mode rather than a posterior.
+            """
+
+            def one_chain(
+                current: t.Any, chain_keys: Array
+            ) -> t.Tuple[t.Any, t.Tuple[Array, Array]]:
+                def one_step(
+                    current: t.Any, step_key: Array
+                ) -> t.Tuple[t.Any, t.Tuple[Array, Array]]:
+                    current, info = sampler.step(step_key, current)
+                    return current, (current.position, info.nonans)
 
                 return jax.lax.scan(one_step, current, chain_keys)
 
@@ -1391,15 +1899,17 @@ class LaplaceOptimizer(Optimizer):
         probe_calls = 0
         per_step: t.Optional[float] = None
         blocks: t.List[Array] = []
+        clean = 0
         done = 0
         started = time.perf_counter()
         while done < steps_per_chain:
             size = min(block, steps_per_chain - done)
             call_started = time.perf_counter()
-            states, block_positions = run_block(
+            states, (block_positions, block_clean) = run_block(
                 states, step_keys[:, done : done + size]
             )
             blocks.append(jax.block_until_ready(block_positions))
+            clean += int(np.asarray(jax.block_until_ready(block_clean)).sum())
             done += size
             call_time = time.perf_counter() - call_started
             if per_step is None:
@@ -1421,7 +1931,54 @@ class LaplaceOptimizer(Optimizer):
                 (steps_per_chain - done) * per_step,
             )
 
+        # Two numbers decide whether these draws are a posterior or a spike at
+        # the mode. Reverted steps say whether the flow is running at all. The
+        # spread in the whitened coordinates says whether the walk covered the
+        # target: an accurate whitening puts the posterior at a spread of 1 in
+        # every coordinate, so a spread far below 1 is a chain that stayed near
+        # its starting point, and a spread far above 1 is a posterior wider than
+        # the Laplace covariance, which makes the Laplace error bars too small.
         positions_v = jnp.concatenate(blocks, axis=1).reshape(-1, dimension)
+        taken = done * self.num_chains
+        reverted = taken - clean
+        spread = np.std(np.asarray(positions_v), axis=0)
+        self.info(
+            "MCLMC: %d of %d steps reverted (%.1f%%); the draws span %.2f to "
+            "%.2f in the whitened coordinates, where the Laplace Gaussian is 1",
+            reverted,
+            taken,
+            100.0 * reverted / max(taken, 1),
+            float(np.min(spread)),
+            float(np.max(spread)),
+        )
+        if reverted > taken // 2:
+            self.warning(
+                "MCLMC: %d of %d steps produced a NaN and were reverted, so "
+                "the chains stayed where they started and these draws are that "
+                "starting point, not a posterior. The whole run spans %.2f in "
+                "the whitened coordinates, where it should be about 1",
+                reverted,
+                taken,
+                float(np.max(spread)),
+            )
+        elif float(np.max(spread)) < 0.2:
+            self.warning(
+                "MCLMC: the draws span only %.2f of the whitened posterior, "
+                "whose scale is 1, so the chains moved by a hundredth of their "
+                "own width and these draws are not the posterior. Raise "
+                "num_samples (the cost is one gradient per step) or check the "
+                "step size %.3g above",
+                float(np.max(spread)),
+                float(step_size),
+            )
+        elif float(np.median(spread)) > 3.0:
+            self.warning(
+                "MCLMC: the posterior is %.1f times wider than the Laplace "
+                "covariance along its median direction, so the Laplace error "
+                "bars understate it; the draws here are the ones to use",
+                float(np.median(spread)),
+            )
+
         positions = u_map[None, :] + positions_v @ factor.T
         theta = transform_of(positions)
         return np.asarray(theta[:, : self._n_physical]).copy()
@@ -1497,17 +2054,33 @@ class LaplaceOptimizer(Optimizer):
             jax.jit(profile_of, device=self.device)(theta)
         )
 
+        # The SMC particles carry weights, so the band is the weighted
+        # standard deviation of the same draws; for equal weights this is the
+        # population standard deviation the chain samplers already used.
+        weights = jnp.asarray(self.get_weights(0), dtype=jnp.float64)
+
+        def weight_of(values: Array) -> Array:
+            """Reshape the weights so they broadcast over the draw axis."""
+            return weights.reshape((-1,) + (1,) * (values.ndim - 1))
+
+        def weighted_std(values: Array) -> Array:
+            """Standard deviation of the draws along the draw axis."""
+            w = weight_of(values)
+            mean = jnp.sum(w * values, axis=0)
+            variance = jnp.sum(w * (values - mean) ** 2, axis=0)
+            return jnp.sqrt(variance)
+
         profile_dict = {
-            "temp_profile_std": np.asarray(jnp.std(temperature, axis=0)),
-            "active_mix_profile_std": np.asarray(jnp.std(active, axis=0)),
-            "inactive_mix_profile_std": np.asarray(jnp.std(inactive, axis=0)),
+            "temp_profile_std": np.asarray(weighted_std(temperature)),
+            "active_mix_profile_std": np.asarray(weighted_std(active)),
+            "inactive_mix_profile_std": np.asarray(weighted_std(inactive)),
         }
-        spectrum_dict = {"native_std": np.asarray(jnp.std(depth, axis=0))}
+        spectrum_dict = {"native_std": np.asarray(weighted_std(depth))}
         if atmosphere.binning_matrix is not None:
             # One batched product instead of a vmap over the draws: the
             # operator is a plain matrix so there is nothing to map.
             binned = jnp.matmul(depth, atmosphere.binning_matrix.T)
-            spectrum_dict["binned_std"] = np.asarray(jnp.std(binned, axis=0))
+            spectrum_dict["binned_std"] = np.asarray(weighted_std(binned))
         result = (profile_dict, spectrum_dict)
         if mpi.nprocs() > 1:
             mpi.broadcast(result)
@@ -1788,16 +2361,16 @@ class LaplaceOptimizer(Optimizer):
         extra:
             Samples, their weights and the per-parameter summaries taken from
             them, under the same keys :class:`~taurex.optimizer.multinest.
-            MultiNestOptimizer` writes. The two samplers here already hold the
-            draws: the Laplace approximation makes ``num_samples`` of them from
-            the fitted covariance and NUTS makes them from the chains, and
-            until now only the median of those draws was used and the draws
-            themselves dropped, which left the output file with no
-            ``fit_params``/``tracedata``/``weights`` and made
-            ``taurex-plot --plot-posteriors`` (and any comparison against a
-            nested-sampling corner plot) impossible. Storing them costs one
-            array of ``num_samples`` x ``nparams`` floats, so no extra
-            likelihood evaluations.
+            MultiNestOptimizer` writes. The samplers here already hold the
+            draws: the Laplace approximation makes ``num_samples`` of them
+            from the fitted covariance, NUTS and MCLMC make them from their
+            chains, and SMC returns its weighted particles. Until now only the
+            median of those draws was used and the draws themselves dropped,
+            which left the output file with no ``fit_params``/``tracedata``/
+            ``weights`` and made ``taurex-plot --plot-posteriors`` (and any
+            comparison against a nested-sampling corner plot) impossible.
+            Storing them costs one array of ``num_samples`` x ``nparams``
+            floats, so no extra likelihood evaluations.
 
         """
         yield 0, self._map, self._median, [
@@ -1871,8 +2444,11 @@ class LaplaceOptimizer(Optimizer):
     def get_weights(self, solution_id: int) -> npt.NDArray[np.float64]:
         """Weights of the posterior samples.
 
-        The Laplace draws are already samples from the posterior, so they carry
-        equal weight.
+        The Laplace, NUTS and MCLMC draws are already samples from the
+        posterior, so they carry equal weight. The SMC particles are weighted
+        by the final stage's incremental likelihood, and those weights are
+        returned so the reported quantiles use them instead of pretending the
+        particles are equally probable.
 
         Parameters
         ----------
@@ -1882,10 +2458,12 @@ class LaplaceOptimizer(Optimizer):
         Returns
         -------
         :obj:`numpy.ndarray`
-            Uniform weights
+            Normalised weights
 
         """
         samples = self.get_samples(solution_id)
+        if self._weights is not None:
+            return self._weights
         return np.full(samples.shape[0], 1.0 / samples.shape[0])
 
     @property
@@ -1899,9 +2477,60 @@ class LaplaceOptimizer(Optimizer):
         return self._log_posterior
 
     @property
+    def log_evidence(self) -> t.Optional[float]:
+        """Log Bayesian evidence, when the sampler estimates one.
+
+        Only ``sampler='smc'`` returns this: the chain samplers normalise the
+        posterior internally and drop the constant. ``None`` when no evidence
+        was computed.
+        """
+        return self._log_evidence
+
+    @property
+    def log_evidence_error(self) -> t.Optional[float]:
+        """Estimated standard error of :attr:`log_evidence`, or None.
+
+        It is the quadrature sum of each SMC stage's relative variance of its
+        normalising constant, which is what the particle weights of that stage
+        can measure. It reports the Monte Carlo error of the evidence estimate
+        and not the error of the model.
+        """
+        return self._log_evidence_error
+
+    @property
     def log_likelihood_map(self) -> t.Optional[float]:
         """Log likelihood at the maximum a posteriori point."""
         return self._log_likelihood
+
+    def generate_solution(
+        self, output_size: OutputSize = OutputSize.heavy
+    ) -> t.Dict[str, t.Any]:
+        """Generate the solution dictionary, adding the evidence when SMC ran.
+
+        The nested samplers write ``GlobalStats`` with their evidence, so the
+        SMC evidence is placed under the same key and the output file has one
+        shape whichever sampler produced it.
+        """
+        solution = super().generate_solution(output_size=output_size)
+        if self._log_evidence is not None:
+            solution["GlobalStats"] = {
+                "global evidence": self._log_evidence,
+                "global evidence error": self._log_evidence_error,
+            }
+        return solution
+
+    def write_optimizer(self, output: t.Any) -> t.Any:
+        """Write the sampler settings and the evidence to the output file."""
+        opt = super().write_optimizer(output)
+        opt.write_string("sampler", self.sampler)
+        if self._log_evidence is not None:
+            opt.write_scalar("log_evidence", self._log_evidence)
+            opt.write_scalar("log_evidence_error", self._log_evidence_error)
+        if self.sampler == "smc":
+            opt.write_scalar("num_particles", self.num_particles)
+            opt.write_scalar("num_mcmc_steps", self.num_mcmc_steps)
+            opt.write_scalar("smc_target_ess", self.smc_target_ess)
+        return opt
 
     @classmethod
     def input_keywords(cls) -> t.Tuple[str, ...]:
