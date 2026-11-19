@@ -340,7 +340,7 @@ class LaplaceOptimizer(Optimizer):
         smc_target_ess: t.Optional[float] = 0.5,
         smc_polish_ess: t.Optional[float] = 0.15,
         smc_max_delta: t.Optional[float] = 0.5,
-        smc_min_delta: t.Optional[float] = 0.1,
+        smc_min_delta: t.Optional[float] = 0.0,
         smc_max_steps: t.Optional[int] = 50,
         smc_step_size: t.Optional[float] = 0.5,
         smc_batch_size: t.Optional[int] = None,
@@ -571,10 +571,11 @@ class LaplaceOptimizer(Optimizer):
             Smallest increase of the tempering parameter in one ``smc`` stage.
             The ESS schedule can ask for increments a thousandth of the range
             when the prior and the likelihood disagree strongly, and each of
-            those stages pays for a full HMC update of every particle. The
-            floor bounds the number of stages at ``ceil(1 / smc_min_delta)``;
-            the weights then have a lower effective sample size than the
-            target, which raises the evidence variance but does not bias it.
+            those stages pays for a full HMC update of every particle. A
+            positive floor bounds the number of stages at
+            ``ceil(1 / smc_min_delta)``, at the cost of a lower effective
+            sample size in those stages; the estimate stays unbiased but its
+            variance grows. The default of zero leaves the ESS schedule free.
 
         smc_max_steps:
             Maximum number of tempering stages. Reaching it before the
@@ -676,9 +677,9 @@ class LaplaceOptimizer(Optimizer):
                 f"smc_max_delta must lie in (0, 1], not {smc_max_delta!r}"
             )
         self.smc_min_delta = float(smc_min_delta)
-        if not 0.0 < self.smc_min_delta <= self.smc_max_delta:
+        if not 0.0 <= self.smc_min_delta <= self.smc_max_delta:
             raise ValueError(
-                "smc_min_delta must lie in (0, smc_max_delta], "
+                "smc_min_delta must lie in [0, smc_max_delta], "
                 f"not {smc_min_delta!r}"
             )
         self.smc_max_steps = max(1, int(smc_max_steps))
@@ -738,25 +739,55 @@ class LaplaceOptimizer(Optimizer):
         fit. The root broadcasts the posterior instead, which keeps the peak
         memory of a job at one compiled model however many ranks it has.
         """
+        from taurex.mpi import broadcast
         from taurex.mpi import get_rank
         from taurex.mpi import nprocs
 
-        if nprocs() > 1 and get_rank() != 0:
+        rank = get_rank()
+        size = nprocs()
+        # SMC is the one sampler that shards: a particle's likelihood and
+        # gradient are independent of every other particle, so the expensive
+        # part of a stage can run on different MPI ranks. The mode fit stays
+        # on rank 0 because the L-BFGS chain is sequential.
+        mpi_smc = self.sampler == "smc" and size > 1
+        fit_on_this_rank = not (mpi_smc and rank != 0)
+        if size > 1 and rank != 0 and not mpi_smc:
             self._receive_fit()
             return
-        if nprocs() > 1:
+        if size > 1 and not mpi_smc:
             # A pipeline that allocates a whole node per rank still gets a
             # correct answer, but only this rank does the fit and the others
             # sit in the broadcast, so the job is slower than one rank with
             # the node to itself. Saying so is cheaper than a walltime limit
             # spent wondering why 128 ranks did not help.
             self.warning(
-                "Fitting on 1 of %d MPI ranks: the quasi-Newton chain is "
-                "sequential and XLA spreads each step over the cores of one "
-                "process, so the other ranks wait for the result rather than "
-                "sharing the work",
+                "Fitting on 1 of %d MPI ranks: the L-BFGS chain and the SMC "
+                "particles run inside one JAX process, and XLA spreads each "
+                "step over that process's threads or device; the other ranks "
+                "wait for the broadcast. Launch the JAX optimizer with one "
+                "task and all the cores of the node (srun --ntasks=1 "
+                "--cpus-per-task=N) rather than many MPI ranks, which only "
+                "add model copies and can oversubscribe the CPUs",
                 nprocs(),
             )
+        elif mpi_smc:
+            self.info(
+                "SMC: %d MPI ranks share the particle axis; the mode fit runs "
+                "on rank 0 and is broadcast",
+                size,
+            )
+
+        import os
+
+        # What XLA is actually working with. On a cluster this is the first
+        # thing to check when a run ignores the cores it was given: os.cpu_count
+        # is the node's CPU count, not necessarily the cgroup limit, and
+        # jax.devices is what the process can see.
+        self.info(
+            "JAX: %d host CPUs, devices %s",
+            os.cpu_count() or 0,
+            [f"{device.platform}:{device.id}" for device in jax.devices()],
+        )
 
         fit_params = self.fitting_parameters
         if not fit_params:
@@ -1034,7 +1065,7 @@ class LaplaceOptimizer(Optimizer):
                 (u0, solver.init(u0), jnp.array(jnp.inf, dtype=dtype), zero, zero),
             )
 
-        def run_starts(starts: Array) -> t.Tuple[Array, Array, Array, Array, Array]:
+        def run_starts(starts: Array) -> t.Tuple[t.Any, ...]:
             """Fit every starting point and keep the best posterior.
 
             :func:`jax.lax.map` runs the starts one after another inside the
@@ -1043,11 +1074,14 @@ class LaplaceOptimizer(Optimizer):
             finished and its extra iterations are not worth the risk of moving
             a converged start off its optimum, so each start gets its own loop.
             """
-            u_maps, _, gradient_norms, steps, trials = jax.lax.map(run, starts)
+            u_maps, states, gradient_norms, steps, trials = jax.lax.map(
+                run, starts
+            )
             scores = jax.lax.map(objective, u_maps)
             best = jnp.argmin(scores)
             return (
                 u_maps[best],
+                jax.tree.map(lambda leaf: leaf[best], states),
                 gradient_norms[best],
                 steps[best],
                 trials[best],
@@ -1074,91 +1108,145 @@ class LaplaceOptimizer(Optimizer):
         log_likelihood_of = jax.jit(log_like_of, device=self.device)
         solve = jax.jit(run_starts, device=self.device)
 
-        # Tracing and compiling is a one off cost that no eager implementation
-        # pays, so it is measured separately and reported: it is paid once per
-        # fit here and once per process if the compiled functions stayed alive.
-        # Every shape the fit will use is compiled now, so that the times below
-        # are execution times rather than hidden compilation.
-        draws = jnp.zeros((self.num_samples, u.shape[0]), dtype=dtype)
-        started = time.perf_counter()
-        solve.lower(starts).compile()
-        transform_of.lower(u).compile()
-        transform_of.lower(draws).compile()
-        log_likelihood_of.lower(u[: self._n_physical], data, error).compile()
-        if self.sampler == "laplace":
-            # These two are only used by the Laplace covariance and its push
-            # forward to parameter space. Every other sampler builds its own
-            # Hessian from the objective with the transform Jacobian, so
-            # compiling these programs here would be paid for nothing.
-            hessian_of.lower(u).compile()
-            jacobian_of.lower(u).compile()
-        self.compile_time = time.perf_counter() - started
+        u_map: t.Optional[Array] = None
+        lbfgs_state: t.Any = None
+        if fit_on_this_rank:
+            # Tracing and compiling is a one off cost that no eager
+            # implementation pays, so it is measured separately and reported:
+            # it is paid once per fit here and once per process if the
+            # compiled functions stayed alive. Every shape the fit will use is
+            # compiled now, so that the times below are execution times rather
+            # than hidden compilation.
+            draws = jnp.zeros((self.num_samples, u.shape[0]), dtype=dtype)
+            started = time.perf_counter()
+            solve.lower(starts).compile()
+            transform_of.lower(u).compile()
+            transform_of.lower(draws).compile()
+            log_likelihood_of.lower(u[: self._n_physical], data, error).compile()
+            if self.sampler == "laplace":
+                # These two are only used by the Laplace covariance and its
+                # push forward to parameter space. Every other sampler builds
+                # its own Hessian from the objective with the transform
+                # Jacobian, so compiling these programs here would be paid for
+                # nothing.
+                hessian_of.lower(u).compile()
+                jacobian_of.lower(u).compile()
+            self.compile_time = time.perf_counter() - started
 
-        started = time.perf_counter()
-        # JAX dispatches asynchronously, so the result is waited on here: the
-        # optimiser loop runs on the device and the wall clock only measures it
-        # once something asks for the value.
-        u_map, gradient_norm, steps, trials, score = jax.block_until_ready(
-            solve(starts)
-        )
-        self.fit_time = time.perf_counter() - started
-
-        self.iterations = int(steps)
-        self.function_evaluations = int(steps + trials)
-        self.gradient_evaluations = int(steps)
-        if self.iterations >= fit_iterations and (
-            float(gradient_norm) > fit_tolerance
-        ):
-            # The objective of a retrieval is flat enough that most fits stop
-            # here rather than on the gradient tolerance. Saying so is the
-            # difference between "this is the mode" and "this is as far as the
-            # fit got"; the point returned is the best one it found.
-            self.warning(
-                "The quasi-Newton fit reached its iteration limit after %d "
-                "steps with gradient norm %.3e, above the tolerance %.3e",
-                self.iterations,
-                float(gradient_norm),
-                fit_tolerance,
+            started = time.perf_counter()
+            # JAX dispatches asynchronously, so the result is waited on here:
+            # the optimiser loop runs on the device and the wall clock only
+            # measures it once something asks for the value.
+            u_map, lbfgs_state, gradient_norm, steps, trials, score = (
+                jax.block_until_ready(solve(starts))
             )
+            self.fit_time = time.perf_counter() - started
 
-        theta_full = transform_of(u_map)
-        self._map = np.asarray(theta_full[: self._n_physical]).copy()
-        if jitter:
-            self._jitter_map = float(theta_full[self._n_physical])
-            # Host arithmetic: four operations on a vector of the length of the
-            # data, which are cheaper to compute than to dispatch.
-            error_effective = np.sqrt(np.asarray(error) ** 2 + self._jitter_map**2)
-        else:
-            self._jitter_map = None
-            error_effective = error
-        self._log_likelihood = float(
-            log_likelihood_of(theta_full[: self._n_physical], data, error_effective)
-        )
-        # The compiled fit already returned the negative log posterior at the
-        # point it kept, so it does not have to be evaluated again: calling
-        # ``objective`` here would run the whole atmosphere eagerly, which
-        # costs a small compilation per operation rather than a dispatch.
-        self._log_posterior = -float(score)
+            self.iterations = int(steps)
+            self.function_evaluations = int(steps + trials)
+            self.gradient_evaluations = int(steps)
+            if self.iterations >= fit_iterations and (
+                float(gradient_norm) > fit_tolerance
+            ):
+                # The objective of a retrieval is flat enough that most fits
+                # stop here rather than on the gradient tolerance. Saying so is
+                # the difference between "this is the mode" and "this is as far
+                # as the fit got"; the point returned is the best one it found.
+                self.warning(
+                    "The quasi-Newton fit reached its iteration limit after %d "
+                    "steps with gradient norm %.3e, above the tolerance %.3e",
+                    self.iterations,
+                    float(gradient_norm),
+                    fit_tolerance,
+                )
+
+            theta_full = transform_of(u_map)
+            self._map = np.asarray(theta_full[: self._n_physical]).copy()
+            if jitter:
+                self._jitter_map = float(theta_full[self._n_physical])
+                # Host arithmetic: four operations on a vector of the length of
+                # the data, which are cheaper to compute than to dispatch.
+                error_effective = np.sqrt(
+                    np.asarray(error) ** 2 + self._jitter_map**2
+                )
+            else:
+                self._jitter_map = None
+                error_effective = error
+            self._log_likelihood = float(
+                log_likelihood_of(
+                    theta_full[: self._n_physical], data, error_effective
+                )
+            )
+            # The compiled fit already returned the negative log posterior at
+            # the point it kept, so it does not have to be evaluated again:
+            # calling ``objective`` here would run the whole atmosphere
+            # eagerly, which costs a small compilation per operation rather
+            # than a dispatch.
+            self._log_posterior = -float(score)
 
         started = time.perf_counter()
         if self.sampler == "smc":
-            # The mode and its covariance are the proposal for the particles,
-            # so the Hessian is needed even when the run ends in the
-            # importance-sampling shortcut and never takes a gradient.
-            nuts_hessian_of = jax.jit(
-                jax.hessian(nuts_objective), device=self.device
-            )
-            covariance, variance_scale = self._laplace_covariance(
-                nuts_hessian_of, u_map
-            )
-            covariance_u = covariance * variance_scale
-            self._u_covariance = covariance_u
+            if fit_on_this_rank:
+                # The mode and its covariance are the proposal for the
+                # particles, so the Hessian is needed even when the run ends in
+                # the importance-sampling shortcut and never takes a gradient.
+                nuts_hessian_of = jax.jit(
+                    jax.hessian(nuts_objective), device=self.device
+                )
+                covariance, variance_scale = self._laplace_covariance(
+                    nuts_hessian_of, u_map
+                )
+                covariance_u = covariance * variance_scale
+                self._u_covariance = covariance_u
+                lbfgs_covariance = None
+                if not self._is_usable_covariance(covariance_u):
+                    lbfgs_covariance = self._lbfgs_covariance(
+                        lbfgs_state, u.shape[0]
+                    )
+            else:
+                covariance_u = None
+                lbfgs_covariance = None
+            if mpi_smc:
+                # The proposal, the metric and every result of the mode fit are
+                # small; send them once and let every rank run the same
+                # particle state with a shard of the likelihood and gradients.
+                setup = None
+                if rank == 0:
+                    setup = {
+                        "u_map": np.asarray(u_map),
+                        "covariance_u": np.asarray(covariance_u),
+                        "lbfgs_covariance": lbfgs_covariance,
+                        "map": self._map,
+                        "log_likelihood": self._log_likelihood,
+                        "log_posterior": self._log_posterior,
+                        "jitter_map": self._jitter_map,
+                        "iterations": self.iterations,
+                        "function_evaluations": self.function_evaluations,
+                        "gradient_evaluations": self.gradient_evaluations,
+                        "compile_time": self.compile_time,
+                        "fit_time": self.fit_time,
+                    }
+                setup = broadcast(setup)
+                u_map = jnp.asarray(setup["u_map"], dtype=dtype)
+                covariance_u = jnp.asarray(setup["covariance_u"], dtype=dtype)
+                lbfgs_covariance = setup["lbfgs_covariance"]
+                self._u_covariance = covariance_u
+                self._map = setup["map"]
+                self._log_likelihood = setup["log_likelihood"]
+                self._log_posterior = setup["log_posterior"]
+                self._jitter_map = setup["jitter_map"]
+                self.iterations = setup["iterations"]
+                self.function_evaluations = setup["function_evaluations"]
+                self.gradient_evaluations = setup["gradient_evaluations"]
+                self.compile_time = setup["compile_time"]
+                self.fit_time = setup["fit_time"]
             self._samples, self._weights = self._run_smc(
                 log_prior_u,
                 log_likelihood_u,
                 transform_of,
                 u_map,
                 covariance_u,
+                lbfgs_covariance,
             )
             self._median = np.array(
                 [
@@ -1274,6 +1362,7 @@ class LaplaceOptimizer(Optimizer):
         transform_of: t.Callable[[Array], Array],
         u_map: Array,
         covariance_u: Array,
+        lbfgs_covariance: t.Optional[npt.NDArray[np.float64]] = None,
     ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         """Draw posterior samples and the evidence with tempered SMC.
 
@@ -1346,8 +1435,35 @@ class LaplaceOptimizer(Optimizer):
         self._logger.setLevel(logging.INFO)
 
         dtype = jnp.float64
+        from taurex.mpi import get_rank, nprocs
+
+        rank = get_rank()
+        size = nprocs()
+        mpi = size > 1
         particles_count = self.num_particles
         dimension = u_map.shape[0]
+        if mpi:
+            # The particle axis is split into equal contiguous chunks, so the
+            # allgather concatenates back into the global order. A count that
+            # does not divide is rounded up rather than leaving a rank with an
+            # empty shard and a shape of its own to compile.
+            if particles_count % size:
+                adjusted = ((particles_count + size - 1) // size) * size
+                self.info(
+                    "SMC: %d particles rounded up to %d so the %d MPI ranks "
+                    "split them evenly",
+                    particles_count,
+                    adjusted,
+                    size,
+                )
+                particles_count = adjusted
+            if particles_count < size:
+                raise ValueError(
+                    f"SMC with {size} MPI ranks needs at least {size} "
+                    f"particles, not {particles_count}; raise num_particles"
+                )
+        chunk = particles_count // size if mpi else particles_count
+        local_slice = slice(rank * chunk, (rank + 1) * chunk)
 
         # Batching the particle axis keeps the working set bounded. The budget
         # has to be generous: one particle holds several ``(nlayers, nwn)``
@@ -1363,21 +1479,59 @@ class LaplaceOptimizer(Optimizer):
             batch = max(1, _SMC_BATCH_BYTES // max(per_particle, 1))
         else:
             batch = self.smc_batch_size
-        batch = min(batch, particles_count)
-        # ``batch_size=0`` asks blackjax for a single vmap over all particles,
-        # which is the fastest option whenever the memory estimate allows it.
-        vectorised_batch = 0 if batch >= particles_count else batch
+        batch = min(batch, chunk)
+        # ``batch_size=0`` asks blackjax for a single vmap over the local
+        # chunk, which is the fastest option whenever the memory estimate
+        # allows it.
+        vectorised_batch = 0 if batch >= chunk else batch
         batched_likelihood = smc_base.map_fn(
             log_likelihood_fn, vectorised_batch
         )
+        if mpi:
+            from mpi4py import MPI
+
+            comm = MPI.COMM_WORLD
+
+            def likelihood_of(
+                positions: npt.NDArray[np.float64],
+            ) -> npt.NDArray[np.float64]:
+                """Log likelihood of the global particles, one shard per rank."""
+                local = np.asarray(
+                    jax.block_until_ready(
+                        batched_likelihood(jnp.asarray(positions[local_slice]))
+                    )
+                )
+                pieces = comm.allgather(np.ascontiguousarray(local))
+                return np.concatenate(pieces, axis=0)
+
+        else:
+            comm = None
+
+            def likelihood_of(
+                positions: npt.NDArray[np.float64],
+            ) -> npt.NDArray[np.float64]:
+                """Log likelihood of a batch of unconstrained vectors."""
+                return np.asarray(
+                    jax.block_until_ready(
+                        batched_likelihood(jnp.asarray(positions))
+                    )
+                )
+
         self.info(
-            "SMC: %d particles, estimated %.0f MB per particle, batches of %s, "
-            "HMC %d leapfrogs x %d transition(s)",
+            "SMC: %d particles on %d rank(s), %d per rank, estimated %.0f MB "
+            "per particle, batches of %s, HMC %d leapfrogs x %d transition(s)",
             particles_count,
+            size,
+            chunk,
             per_particle / 1e6,
             "all" if vectorised_batch == 0 else str(batch),
             self.smc_hmc_steps,
             self.num_mcmc_steps,
+        )
+        self.info(
+            "SMC: running on %s; the particle axis is the only parallel one, "
+            "the leapfrog steps and tempering stages are sequential",
+            "JAX's default device" if self.device is None else str(self.device),
         )
 
         def log_ess(values: npt.NDArray[np.float64]) -> float:
@@ -1422,6 +1576,18 @@ class LaplaceOptimizer(Optimizer):
         else:
             smallest = float("-inf")
         usable_covariance = smallest > 0.0
+        if not usable_covariance and lbfgs_covariance is not None:
+            candidate = np.asarray(lbfgs_covariance, dtype=float)
+            if self._is_usable_covariance(candidate):
+                self.warning(
+                    "SMC: the Laplace Hessian is not positive definite "
+                    "(smallest eigenvalue %s); using the L-BFGS "
+                    "inverse-Hessian approximation for the proposal and the "
+                    "metric",
+                    smallest,
+                )
+                covariance_np = candidate
+                usable_covariance = True
         if usable_covariance:
             factor = np.linalg.cholesky(covariance_np)
             log_det = float(np.sum(np.log(np.diag(factor))))
@@ -1476,6 +1642,7 @@ class LaplaceOptimizer(Optimizer):
         log_weights = np.zeros(particles_count, dtype=float)
         log_evidence = 0.0
         log_evidence_variance = 0.0
+        log_like: t.Optional[npt.NDArray[np.float64]] = None
         if self.smc_start == "laplace" and usable_covariance:
             # A Student-t with four degrees of freedom has twice the variance
             # of the Gaussian it is centred on and polynomial tails. A pure
@@ -1555,6 +1722,8 @@ class LaplaceOptimizer(Optimizer):
                     "batch_size": batch,
                     "hmc_steps": self.smc_hmc_steps,
                     "polish": False,
+                    "ranks": size,
+                    "particles": particles_count,
                 }
                 weights = np.exp(
                     log_full - scipy_special.logsumexp(log_full)
@@ -1635,6 +1804,26 @@ class LaplaceOptimizer(Optimizer):
             particles_count,
             start,
         )
+
+        if mpi:
+            return self._run_smc_sharded(
+                log_prior_fn=log_prior_fn,
+                log_likelihood_fn=log_likelihood_fn,
+                transform_of=transform_of,
+                positions=positions,
+                log_weights=log_weights,
+                log_like=log_like,
+                beta0=beta0,
+                log_evidence=log_evidence,
+                log_evidence_variance=log_evidence_variance,
+                polish=polish,
+                covariance_np=covariance_np,
+                batched_likelihood=batched_likelihood,
+                local_slice=local_slice,
+                particles_count=particles_count,
+                start=start,
+                proposal_ess=proposal_ess,
+            )
 
         # The HMC metric is the Laplace covariance, so the posterior is about
         # isotropic in the metric and a step of order one works. The trajectory
@@ -1837,6 +2026,8 @@ class LaplaceOptimizer(Optimizer):
             "batch_size": batch,
             "hmc_steps": self.smc_hmc_steps,
             "polish": polish,
+            "ranks": size,
+            "particles": particles_count,
         }
 
         # The particles carry the final weights; the transform is applied to
@@ -1856,6 +2047,380 @@ class LaplaceOptimizer(Optimizer):
             particles_count,
             100.0 * ess_value / particles_count,
         )
+        return samples, weights
+
+    def _run_smc_sharded(
+        self,
+        log_prior_fn: t.Callable[[Array], Array],
+        log_likelihood_fn: t.Callable[[Array], Array],
+        transform_of: t.Callable[[Array], Array],
+        positions: npt.NDArray[np.float64],
+        log_weights: npt.NDArray[np.float64],
+        log_like: t.Optional[npt.NDArray[np.float64]],
+        beta0: float,
+        log_evidence: float,
+        log_evidence_variance: float,
+        polish: bool,
+        covariance_np: npt.NDArray[np.float64],
+        batched_likelihood: t.Callable[[Array], Array],
+        local_slice: slice,
+        particles_count: int,
+        start: str,
+        proposal_ess: float,
+    ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        """Run the SMC stages with the particle axis split over MPI ranks.
+
+        The particle state itself is small (a few thousand floats), so it is
+        replicated on every rank and only the expensive part is sharded: each
+        rank evaluates the likelihood and the HMC gradients of its contiguous
+        chunk, then an allgather reconstructs the global likelihood and
+        position arrays. Weights, the effective sample size, the tempering
+        increment, the resampling indices and the evidence are therefore
+        identical on every rank, and the stage decisions need no collective of
+        their own.
+
+        The mode fit is not sharded: its L-BFGS chain is sequential. Rank 0
+        runs it and broadcasts the mode and covariance before this method is
+        called.
+
+        Parameters
+        ----------
+        log_prior_fn:
+            Log prior density of one unconstrained vector
+
+        log_likelihood_fn:
+            Log likelihood of one unconstrained vector
+
+        transform_of:
+            Compiled map from ``u`` to the parameters
+
+        positions:
+            Global particle positions, shape ``(particles, dimension)``
+
+        log_weights:
+            Global unnormalised log weights of the proposal
+
+        log_like:
+            Global log likelihood at ``positions``, or None when it still has
+            to be evaluated (the prior start)
+
+        beta0:
+            Starting tempering parameter
+
+        log_evidence, log_evidence_variance:
+            Evidence estimate and variance accumulated before the stages
+
+        polish:
+            Whether the run only resamples and moves once at ``beta = 1``
+
+        covariance_np:
+            HMC metric
+
+        batched_likelihood:
+            Local-chunk likelihood map
+
+        local_slice:
+            This rank's contiguous slice of the global particle axis
+
+        particles_count:
+            Global number of particles, divisible by the rank count
+
+        start:
+            Proposal description for the diagnostics
+
+        proposal_ess:
+            Proposal effective sample size for the diagnostics
+
+        Returns
+        -------
+        samples, weights:
+            Global posterior draws and their normalised weights
+
+        """
+        from blackjax.mcmc import hmc as hmc_kernel
+        from mpi4py import MPI
+        from scipy import special as scipy_special
+
+        comm = MPI.COMM_WORLD
+        rank = comm.Get_rank()
+        size = comm.Get_size()
+        chunk = particles_count // size
+        dtype = jnp.float64
+
+        def gather(local: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+            """Allgather equal contiguous shards back into global order."""
+            pieces = comm.allgather(np.ascontiguousarray(local))
+            return np.concatenate(pieces, axis=0)
+
+        def log_ess(values: npt.NDArray[np.float64]) -> float:
+            """Effective sample size of an array of unnormalised log weights."""
+            return float(
+                np.exp(
+                    2.0 * scipy_special.logsumexp(values)
+                    - scipy_special.logsumexp(2.0 * values)
+                )
+            )
+
+        def likelihood_of(
+            global_positions: npt.NDArray[np.float64],
+        ) -> npt.NDArray[np.float64]:
+            """Log likelihood of the global particles, one shard per rank."""
+            local = np.asarray(
+                jax.block_until_ready(
+                    batched_likelihood(
+                        jnp.asarray(global_positions[local_slice])
+                    )
+                )
+            )
+            return gather(local)
+
+        def resample_indices(
+            weights: npt.NDArray[np.float64], seed_offset: int
+        ) -> npt.NDArray[np.int64]:
+            """Systematic resampling, computed once by rank 0 and shared."""
+            if rank == 0:
+                rng = np.random.default_rng(
+                    (0 if self.seed is None else int(self.seed)) + seed_offset
+                )
+                points = (
+                    rng.random() + np.arange(particles_count)
+                ) / particles_count
+                cumulative = np.cumsum(weights)
+                cumulative[-1] = 1.0
+                indices = np.searchsorted(cumulative, points)
+                indices = np.minimum(indices, particles_count - 1)
+            else:
+                indices = None
+            return comm.bcast(indices, root=0)
+
+        def choose_delta(
+            log_likelihood: npt.NDArray[np.float64],
+            target: float,
+            max_delta: float,
+        ) -> float:
+            """Tempering increment that leaves ``target`` particles effective."""
+            target_log = np.log(target * particles_count)
+
+            def objective(delta: float) -> float:
+                return log_ess(delta * log_likelihood) - target_log
+
+            if objective(max_delta) >= 0.0:
+                return max_delta
+            if objective(0.0) <= 0.0:
+                return 0.0
+            low, high = 0.0, max_delta
+            for _ in range(60):
+                middle = 0.5 * (low + high)
+                if objective(middle) > 0.0:
+                    low = middle
+                else:
+                    high = middle
+            return low
+
+        raw_hmc = hmc_kernel.build_kernel()
+        metric = jnp.asarray(covariance_np, dtype=dtype)
+
+        def local_transition(
+            key: Array,
+            local_positions: Array,
+            beta: Array,
+            step_size: Array,
+        ) -> t.Tuple[Array, Array]:
+            """Move this rank's shard with fixed-length HMC transitions."""
+
+            def one(particle: Array, particle_key: Array) -> t.Tuple[Array, Array]:
+                def logdensity(u: Array) -> Array:
+                    return log_prior_fn(u) + beta * log_likelihood_fn(u)
+
+                state = hmc_kernel.init(particle, logdensity)
+
+                def step(carry: t.Any, subkey: Array) -> t.Tuple[t.Any, Array]:
+                    return raw_hmc(
+                        subkey,
+                        carry,
+                        logdensity,
+                        step_size,
+                        metric,
+                        self.smc_hmc_steps,
+                    )
+
+                state, infos = jax.lax.scan(
+                    step,
+                    state,
+                    jax.random.split(particle_key, self.num_mcmc_steps),
+                )
+                return state.position, jnp.mean(infos.acceptance_rate)
+
+            return jax.vmap(one)(
+                local_positions,
+                jax.random.split(key, local_positions.shape[0]),
+            )
+
+        local_transition = jax.jit(local_transition, device=self.device)
+
+        weights = np.exp(log_weights - scipy_special.logsumexp(log_weights))
+        if log_like is None:
+            log_like = likelihood_of(positions)
+        beta = float(beta0)
+        log_z = float(log_evidence)
+        log_z_variance = float(log_evidence_variance)
+        stage = 0
+        accepted = 0.0
+        ess_value = log_ess(log_weights)
+        log_step = np.log(self.smc_step_size)
+        log_step_bar = log_step
+        h_bar = 0.0
+        mu = np.log(10.0 * self.smc_step_size)
+        t0, gamma = 10.0, 0.05
+        key = jax.random.PRNGKey(0 if self.seed is None else int(self.seed))
+        started = time.perf_counter()
+
+        if polish:
+            indices = resample_indices(weights, 1)
+            positions = positions[indices]
+            key, stage_key = jax.random.split(key)
+            stage_key = jax.random.fold_in(stage_key, rank)
+            step_size = jnp.asarray(np.exp(log_step))
+            local_new, local_acceptance = local_transition(
+                stage_key,
+                jnp.asarray(positions[local_slice]),
+                jnp.asarray(1.0, dtype=dtype),
+                step_size,
+            )
+            positions = gather(np.asarray(local_new))
+            weights = np.full(particles_count, 1.0 / particles_count)
+            ess_value = float(particles_count)
+            stage = 1
+            accepted = float(
+                comm.allreduce(
+                    float(jnp.mean(local_acceptance)) * chunk, op=MPI.SUM
+                )
+            ) / particles_count
+            if rank == 0:
+                self.info(
+                    "SMC: polished the resampled proposal with one HMC "
+                    "transition at beta=1 across %d ranks (acceptance %.2f)",
+                    size,
+                    accepted,
+                )
+
+        while beta < 1.0 and stage < self.smc_max_steps:
+            stage += 1
+            remaining = min(self.smc_max_delta, 1.0 - beta)
+            delta = choose_delta(log_like, self.smc_target_ess, remaining)
+            if self.smc_min_delta > 0.0:
+                delta = max(delta, min(self.smc_min_delta, remaining))
+            indices = resample_indices(weights, 104729 * stage)
+            positions = positions[indices]
+            key, stage_key = jax.random.split(key)
+            stage_key = jax.random.fold_in(stage_key, rank)
+            step_size = jnp.asarray(np.exp(log_step))
+            local_new, local_acceptance = local_transition(
+                stage_key,
+                jnp.asarray(positions[local_slice]),
+                jnp.asarray(beta, dtype=dtype),
+                step_size,
+            )
+            positions = gather(np.asarray(local_new))
+            log_like = likelihood_of(positions)
+            log_increment = delta * log_like
+            log_z += float(
+                scipy_special.logsumexp(log_increment)
+                - np.log(particles_count)
+            )
+            weights = np.exp(
+                log_increment - scipy_special.logsumexp(log_increment)
+            )
+            ess_value = 1.0 / float(np.sum(weights**2))
+            log_z_variance += (
+                max(particles_count / max(ess_value, 1.0) - 1.0, 0.0)
+                / particles_count
+            )
+            accepted = float(
+                comm.allreduce(
+                    float(jnp.mean(local_acceptance)) * chunk, op=MPI.SUM
+                )
+            ) / particles_count
+
+            step_number = float(stage)
+            eta = 1.0 / (step_number + t0)
+            h_bar = (1.0 - eta) * h_bar + eta * (
+                _SMC_TARGET_ACCEPT - accepted
+            )
+            log_step = mu - np.sqrt(step_number) / gamma * h_bar
+            log_step_bar = (
+                1.0 - 1.0 / step_number
+            ) * log_step_bar + (1.0 / step_number) * log_step
+            log_step = float(
+                np.clip(min(log_step, log_step_bar), np.log(1e-8), np.log(1e2))
+            )
+            beta += delta
+            if rank == 0:
+                self.info(
+                    "SMC: stage %d, tempering %.4f, ESS %.0f/%d, acceptance "
+                    "%.2f, step size %.3g, log Z %.3f, %.0f s elapsed "
+                    "(%d ranks)",
+                    stage,
+                    beta,
+                    ess_value,
+                    particles_count,
+                    accepted,
+                    float(np.exp(log_step)),
+                    log_z,
+                    time.perf_counter() - started,
+                    size,
+                )
+
+        if beta < 1.0 and rank == 0:
+            self.warning(
+                "SMC stopped after %d stages with the tempering parameter at "
+                "%.4f instead of 1, so these particles and log Z %.3f "
+                "describe the tempered target, not the posterior. Raise "
+                "smc_max_steps or the particle count",
+                stage,
+                beta,
+                log_z,
+            )
+
+        self._log_evidence = log_z
+        self._log_evidence_error = float(np.sqrt(log_z_variance))
+        weights = weights / weights.sum()
+        gradient_evaluations = (
+            stage
+            * self.num_mcmc_steps
+            * particles_count
+            * self.smc_hmc_steps
+        )
+        self._smc_parameters = {
+            "start": start,
+            "beta0": beta0,
+            "proposal_ess": proposal_ess,
+            "stages": stage,
+            "gradient_evaluations": gradient_evaluations,
+            "batch_size": chunk,
+            "hmc_steps": self.smc_hmc_steps,
+            "polish": polish,
+            "ranks": size,
+            "particles": particles_count,
+        }
+        theta = transform_of(jnp.asarray(positions))
+        samples = np.asarray(theta[:, : self._n_physical]).copy()
+        if rank == 0:
+            self.info(
+                "SMC: finished after %d stages in %.0f s on %d ranks, %d "
+                "model gradients (%d per rank), log Z = %.3f +/- %.3f, final "
+                "ESS %.0f/%d (%.1f%%)",
+                stage,
+                time.perf_counter() - started,
+                size,
+                gradient_evaluations,
+                gradient_evaluations // size,
+                log_z,
+                self._log_evidence_error,
+                ess_value,
+                particles_count,
+                100.0 * ess_value / particles_count,
+            )
         return samples, weights
 
     def _run_nuts(
@@ -2624,6 +3189,107 @@ class LaplaceOptimizer(Optimizer):
     def fisher(self) -> t.Optional[npt.NDArray[np.float64]]:
         """Cached Fisher information, filled in by :meth:`fisher_information`."""
         return self._fisher
+
+    @staticmethod
+    def _is_usable_covariance(covariance: t.Any) -> bool:
+        """Whether a matrix can serve as a covariance and HMC metric.
+
+        Parameters
+        ----------
+        covariance:
+            Candidate matrix
+
+        Returns
+        -------
+        bool
+            True when it is finite, symmetric and positive definite
+
+        """
+        matrix = np.asarray(covariance, dtype=float)
+        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+            return False
+        if not np.all(np.isfinite(matrix)):
+            return False
+        matrix = 0.5 * (matrix + matrix.T)
+        return float(np.min(np.linalg.eigvalsh(matrix))) > 0.0
+
+    @staticmethod
+    def _lbfgs_covariance(state: t.Any, dimension: int) -> t.Optional[np.ndarray]:
+        """Inverse-Hessian approximation from an optax L-BFGS state.
+
+        A parameter pinned to a prior bound makes the likelihood Hessian of the
+        constrained vector non-finite, and the Laplace proposal then cannot be
+        built. The L-BFGS history is already there from the mode fit: its
+        curvature pairs are finite even at a bound, and running the two-loop
+        recursion on them gives a positive definite inverse Hessian without a
+        single extra model evaluation. It describes the objective without the
+        transform Jacobian, so it is broader than the posterior; for a proposal
+        that is the safe direction.
+
+        Parameters
+        ----------
+        state:
+            State returned by the compiled L-BFGS solve
+
+        dimension:
+            Number of unconstrained coordinates
+
+        Returns
+        -------
+        :obj:`numpy.ndarray` or None
+            Positive definite approximation, or None when the history is empty
+
+        """
+        curvature = state[0]
+        count = int(np.asarray(curvature.count))
+        memory = int(curvature.diff_params_memory.shape[0])
+        pairs = min(count, memory)
+        if pairs <= 0:
+            return None
+
+        def ordered(values: np.ndarray) -> np.ndarray:
+            order = [int((count - 1 - j) % memory) for j in range(pairs)]
+            return np.asarray(values, dtype=float)[order]
+
+        steps = ordered(curvature.diff_params_memory)
+        gradients = ordered(curvature.diff_updates_memory)
+        weights = ordered(curvature.weights_memory)
+
+        curvature_products = np.sum(steps * gradients, axis=1)
+        gradient_norms = np.sum(gradients * gradients, axis=1)
+        positive = curvature_products > 0.0
+        if not np.any(positive):
+            return None
+        steps = steps[positive]
+        gradients = gradients[positive]
+        weights = weights[positive]
+        gradient_norms = gradient_norms[positive]
+        pairs = steps.shape[0]
+        if gradient_norms[0] <= 0.0:
+            return None
+        gamma = float(curvature_products[positive][0] / gradient_norms[0])
+
+        inverse = np.empty((dimension, dimension), dtype=float)
+        for column in range(dimension):
+            vector = np.zeros(dimension, dtype=float)
+            vector[column] = 1.0
+            alpha = np.empty(pairs, dtype=float)
+            for index in range(pairs):
+                alpha[index] = weights[index] * float(steps[index] @ vector)
+                vector = vector - alpha[index] * gradients[index]
+            result = gamma * vector
+            for index in range(pairs - 1, -1, -1):
+                beta = weights[index] * float(gradients[index] @ result)
+                result = result + steps[index] * (alpha[index] - beta)
+            inverse[:, column] = result
+
+        inverse = 0.5 * (inverse + inverse.T)
+        if not np.all(np.isfinite(inverse)):
+            return None
+        eigenvalues, eigenvectors = np.linalg.eigh(inverse)
+        floor = max(float(np.max(eigenvalues)) * 1e-10, 1e-12)
+        clipped = np.clip(eigenvalues, floor, None)
+        return (eigenvectors * clipped) @ eigenvectors.T
 
     def _laplace_covariance(
         self,
