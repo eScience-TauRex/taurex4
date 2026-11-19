@@ -518,12 +518,20 @@ def test_smc_sampler_is_read_from_the_input_file():
     from taurex.parameter.factory import create_optimizer
 
     optimizer = create_optimizer(
-        {"optimizer": "laplace", "sampler": "smc", "num_samples": 32}
+        {
+            "optimizer": "laplace",
+            "sampler": "smc",
+            "num_samples": 32,
+            "num_particles": 24,
+        }
     )
 
     assert isinstance(optimizer, LaplaceOptimizer)
     assert optimizer.sampler == "smc"
-    assert optimizer.num_particles == 32
+    # The particle count has its own default and does not follow num_samples,
+    # which is what the chain samplers use for draws.
+    assert optimizer.num_particles == 24
+    assert LaplaceOptimizer(num_samples=32).num_particles == 128
 
 
 def test_smc_recovers_a_one_parameter_posterior(taurex_model, observation):
@@ -570,6 +578,28 @@ def test_smc_recovers_a_one_parameter_posterior(taurex_model, observation):
     assert optimizer.log_evidence_error >= 0.0
 
 
+def test_prior_density_in_unconstrained_space_is_normalised():
+    """The density the SMC starts from integrates to one for every prior."""
+    from taurex.core.priors import Gaussian
+    from taurex.core.priors import Uniform
+    from taurex.differentiability import PriorTransform
+
+    u = jnp.asarray(np.linspace(-20.0, 20.0, 200001), dtype=jnp.float64)
+    for prior in (
+        Uniform(bounds=(0.6, 1.4)),
+        Gaussian(mean=1.0, std=0.1),
+    ):
+        transform = PriorTransform(prior, "x", jnp.float64)
+        cube = jax.nn.sigmoid(u)
+        log_density = (
+            transform.log_prior(transform.forward(cube))
+            + transform.log_abs_derivative(cube)
+            + transform.log_normalisation()
+        )
+        integral = np.trapezoid(np.exp(np.asarray(log_density)), np.asarray(u))
+        assert integral == pytest.approx(1.0, abs=1e-5)
+
+
 def test_smc_evidence_is_the_likelihood_of_a_flat_target(taurex_model, observation):
     """With a constant likelihood the evidence is just that constant.
 
@@ -601,7 +631,10 @@ def test_smc_evidence_is_the_likelihood_of_a_flat_target(taurex_model, observati
             jnp.asarray(optimizer._map, dtype=jnp.float64)
         )
     )
-    assert optimizer.log_evidence == pytest.approx(expected, abs=1e-3)
+    # The importance estimate has Monte Carlo error, which the mixture bounds
+    # but does not remove; the point of the check is that no prior-width
+    # constant is missing, which would shift it by O(1).
+    assert optimizer.log_evidence == pytest.approx(expected, abs=0.5)
 
 
 def test_smc_handles_a_fitted_jitter(taurex_model, observation):

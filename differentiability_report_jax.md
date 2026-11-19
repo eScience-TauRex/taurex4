@@ -43,12 +43,13 @@ picks what happens next, all of it off that one fit:
   sample size, which measures how far the posterior is from the Gaussian.
 - `mclmc`: blackjax microcanonical Langevin, one gradient and one sample per step,
   no accept test, integrator error `O(step^2)`, at least two fitted parameters.
-- `smc`: adaptive tempered sequential Monte Carlo with a NUTS inner kernel,
-  started from the prior rather than the mode. Every stage raises the likelihood
-  exponent, reweights, resamples and moves every particle; the sum of the stage
-  normalising constants is the Bayesian evidence. It is the only sampler here
-  that returns `log Z`, and the only one that can reach a posterior mode the
-  input file's starting point never approaches.
+- `smc`: adaptive tempered sequential Monte Carlo. It draws a defensive
+  mixture of a Student-t around the mode (Laplace covariance) and the prior,
+  corrects the initial weights by the exact prior, and only tempers and runs
+  fixed-length HMC for the part the proposal misses. When the proposal carries
+  the posterior the run spends no gradients at all; the sum of the stage
+  normalising constants is the Bayesian evidence. `smc_start = prior` is the
+  slower, multi-modal fallback.
 
 The samplers report the sample covariance; `smc` reports the weighted one. All
 five go through the usual `get_solution`, `get_samples` and `get_weights`, so
