@@ -674,6 +674,46 @@ def test_smc_handles_a_fitted_jitter(taurex_model, observation):
     assert np.isfinite(optimizer.log_evidence)
 
 
+def test_smc_polishes_a_moderate_proposal_without_tempering(
+    taurex_model, observation
+):
+    """A proposal below the shortcut ESS is resampled and polished, not tempered."""
+    optimizer = LaplaceOptimizer(
+        num_samples=96,
+        max_iterations=100,
+        sampler="smc",
+        smc_target_ess=0.99,
+        num_mcmc_steps=1,
+        smc_hmc_steps=2,
+        seed=23,
+    )
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    optimizer.enable_fit("planet_radius")
+
+    truth = np.array([1.07])
+    optimizer.update_model(truth)
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    clean = np.asarray(atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64)))
+    generator = np.random.default_rng(6)
+    observation._obs_spectrum[:, 1] = clean + generator.normal(0.0, 1e-4, clean.shape)
+    optimizer.update_model(truth)
+    optimizer.compute_fit()
+
+    parameters = optimizer.smc_parameters
+    assert parameters["polish"] is True
+    assert parameters["stages"] == 1
+    assert parameters["start"] == "laplace"
+    assert parameters["gradient_evaluations"] == (
+        optimizer.num_particles * optimizer.smc_hmc_steps
+    )
+    assert np.isfinite(optimizer.log_evidence)
+    samples = optimizer.get_samples(0)
+    assert np.all(np.isfinite(samples))
+
+
 def test_smc_draws_weighted_quantiles_and_bands(taurex_model, observation):
     """The solution interface carries the SMC weights through to the output."""
     optimizer = LaplaceOptimizer(

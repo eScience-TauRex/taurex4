@@ -320,7 +320,8 @@ class LaplaceOptimizer(Optimizer):
         memory_size: t.Optional[int] = 10,
         scale_init_precond: t.Optional[bool] = True,
         gradient_tolerance: t.Optional[float] = 1e-10,
-        smc_fit_tolerance: t.Optional[float] = 1e-5,
+        smc_fit_tolerance: t.Optional[float] = 1e-4,
+        smc_max_iterations: t.Optional[int] = 60,
         eigenvalue_floor: t.Optional[float] = 1e-3,
         seed: t.Optional[int] = 0,
         device: t.Optional[str] = None,
@@ -337,7 +338,9 @@ class LaplaceOptimizer(Optimizer):
         smc_hmc_steps: t.Optional[int] = 3,
         smc_start: t.Optional[str] = "laplace",
         smc_target_ess: t.Optional[float] = 0.5,
+        smc_polish_ess: t.Optional[float] = 0.15,
         smc_max_delta: t.Optional[float] = 0.5,
+        smc_min_delta: t.Optional[float] = 0.1,
         smc_max_steps: t.Optional[int] = 50,
         smc_step_size: t.Optional[float] = 0.5,
         smc_batch_size: t.Optional[int] = None,
@@ -386,14 +389,22 @@ class LaplaceOptimizer(Optimizer):
 
         smc_fit_tolerance:
             Convergence tolerance on the gradient norm for the mode search
-            that seeds the ``smc`` proposal. It defaults to ``1e-5`` rather
+            that seeds the ``smc`` proposal. It defaults to ``1e-4`` rather
             than ``gradient_tolerance``: the mode only centres the proposal,
             the posterior comes from the particles, and a retrieval fit that
             is still chasing a gradient of ``1e-10`` can spend most of the
             run doing it. On a three-parameter test the same posterior and
-            ``log Z`` came out of 12 iterations at ``1e-5`` and 200 at
+            ``log Z`` came out of a dozen iterations at ``1e-4`` and 200 at
             ``1e-10``. Set it equal to ``gradient_tolerance`` to restore the
             strict mode search.
+
+        smc_max_iterations:
+            Hard cap on the mode-search iterations for ``smc``, whatever the
+            gradient tolerance is. A retrieval objective can plateau above
+            any useful gradient tolerance, and the fit then runs until
+            ``max_iterations``; the proposal only needs the mode it has
+            already found. ``max_iterations`` is still the cap for the other
+            samplers, whose reported MAP is the point of the fit.
 
         eigenvalue_floor:
             Ridge added to the scaled Hessian before inverting it. It bounds
@@ -540,11 +551,30 @@ class LaplaceOptimizer(Optimizer):
             of the particles effective; a smaller value takes fewer, larger
             stages and a larger value takes more, smaller ones.
 
+        smc_polish_ess:
+            Fraction of the particles the proposal must keep for ``smc`` to
+            accept it with one HMC polish at ``beta = 1`` instead of
+            tempering it. This covers the common middle case: the weights are
+            not good enough to trust as they are, but they are good enough
+            that resampling and moving the particles once is cheaper and more
+            accurate than a ladder of tempering stages. The evidence error
+            reports the weight degeneracy either way; below this fraction the
+            proposal is abandoned for the prior start.
+
         smc_max_delta:
             Largest increase of the tempering parameter in one ``smc`` stage.
             The default of one half allows two stages, which is enough to
             correct a proposal that is off by a moderate amount without
             spending a long chain of stages on it.
+
+        smc_min_delta:
+            Smallest increase of the tempering parameter in one ``smc`` stage.
+            The ESS schedule can ask for increments a thousandth of the range
+            when the prior and the likelihood disagree strongly, and each of
+            those stages pays for a full HMC update of every particle. The
+            floor bounds the number of stages at ``ceil(1 / smc_min_delta)``;
+            the weights then have a lower effective sample size than the
+            target, which raises the evidence variance but does not bias it.
 
         smc_max_steps:
             Maximum number of tempering stages. Reaching it before the
@@ -597,6 +627,7 @@ class LaplaceOptimizer(Optimizer):
                 "smc_fit_tolerance must be positive, "
                 f"not {smc_fit_tolerance!r}"
             )
+        self.smc_max_iterations = max(1, int(smc_max_iterations))
         self.eigenvalue_floor = float(eigenvalue_floor)
         self.seed = seed
         self.device = None if device is None else jax.devices(device)[0]
@@ -634,10 +665,21 @@ class LaplaceOptimizer(Optimizer):
             raise ValueError(
                 f"smc_target_ess must lie in (0, 1], not {smc_target_ess!r}"
             )
+        self.smc_polish_ess = float(smc_polish_ess)
+        if not 0.0 <= self.smc_polish_ess <= 1.0:
+            raise ValueError(
+                f"smc_polish_ess must lie in [0, 1], not {smc_polish_ess!r}"
+            )
         self.smc_max_delta = float(smc_max_delta)
         if not 0.0 < self.smc_max_delta <= 1.0:
             raise ValueError(
                 f"smc_max_delta must lie in (0, 1], not {smc_max_delta!r}"
+            )
+        self.smc_min_delta = float(smc_min_delta)
+        if not 0.0 < self.smc_min_delta <= self.smc_max_delta:
+            raise ValueError(
+                "smc_min_delta must lie in (0, smc_max_delta], "
+                f"not {smc_min_delta!r}"
             )
         self.smc_max_steps = max(1, int(smc_max_steps))
         self.smc_step_size = float(smc_step_size)
@@ -888,6 +930,11 @@ class LaplaceOptimizer(Optimizer):
             if self.sampler == "smc"
             else self.gradient_tolerance
         )
+        fit_iterations = (
+            self.smc_max_iterations
+            if self.sampler == "smc"
+            else self.max_iterations
+        )
 
         def run(u0: Array) -> t.Tuple[Array, Array, Array, Array, Array]:
             """Run the whole fit as one compiled program.
@@ -935,7 +982,7 @@ class LaplaceOptimizer(Optimizer):
             def condition(carry):
                 _, _, gradient_norm, steps, _ = carry
                 return (gradient_norm > fit_tolerance) & (
-                    steps < self.max_iterations
+                    steps < fit_iterations
                 )
 
             def body(carry):
@@ -959,7 +1006,7 @@ class LaplaceOptimizer(Optimizer):
                 # without this the extra steps would keep moving the starts that
                 # finished first away from their own optimum.
                 active = (gradient_norm > fit_tolerance) & (
-                    steps < self.max_iterations
+                    steps < fit_iterations
                 )
                 u_next = jnp.where(active, u_next, u_current)
                 new_state = jax.tree.map(
@@ -1059,7 +1106,7 @@ class LaplaceOptimizer(Optimizer):
         self.iterations = int(steps)
         self.function_evaluations = int(steps + trials)
         self.gradient_evaluations = int(steps)
-        if self.iterations >= self.max_iterations and (
+        if self.iterations >= fit_iterations and (
             float(gradient_norm) > fit_tolerance
         ):
             # The objective of a retrieval is flat enough that most fits stop
@@ -1424,6 +1471,7 @@ class LaplaceOptimizer(Optimizer):
 
         start = "prior"
         beta0 = 0.0
+        polish = False
         proposal_ess = float(particles_count)
         log_weights = np.zeros(particles_count, dtype=float)
         log_evidence = 0.0
@@ -1506,6 +1554,7 @@ class LaplaceOptimizer(Optimizer):
                     "gradient_evaluations": 0,
                     "batch_size": batch,
                     "hmc_steps": self.smc_hmc_steps,
+                    "polish": False,
                 }
                 weights = np.exp(
                     log_full - scipy_special.logsumexp(log_full)
@@ -1519,29 +1568,57 @@ class LaplaceOptimizer(Optimizer):
                 )
                 theta = transform_of(jnp.asarray(positions, dtype=dtype))
                 return np.asarray(theta[:, : self._n_physical]).copy(), weights
-            # The proposal is not good enough to skip HMC. Start tempering at
-            # the furthest point where the weights still have a usable
-            # effective sample; HMC moves what survives, and the initial ESS
-            # is carried in the evidence error rather than hidden. Starting
-            # from a smaller ESS here is what avoids a long run of tiny
-            # increments at the bottom of the temperature ladder.
-            grid = np.linspace(0.0, 1.0, 21)[:-1]
-            ess_grid = np.array(
-                [log_ess(log_prior + beta * log_like - log_proposal) for beta in grid]
-            )
-            usable = max(2.0, 0.25 * target_count)
-            qualifying = grid[ess_grid >= usable]
-            beta0 = float(qualifying.max()) if qualifying.size else 0.0
-            if beta0 > 0.0:
+            polish = proposal_ess >= self.smc_polish_ess * particles_count
+            if polish:
+                # The weights are not good enough to use as they are, but they
+                # are good enough that resampling them and moving the particles
+                # once at beta = 1 is far cheaper than a ladder of stages. HMC
+                # at beta = 1 leaves the posterior invariant, so the draws stay
+                # exact; only the evidence keeps the weight variance, which is
+                # reported.
                 start = "laplace"
-                log_weights = log_prior + beta0 * log_like - log_proposal
+                beta0 = 1.0
+                log_weights = log_full
                 log_evidence = float(
-                    scipy_special.logsumexp(log_weights) - np.log(particles_count)
+                    scipy_special.logsumexp(log_full) - np.log(particles_count)
                 )
-                ess0 = log_ess(log_weights)
                 log_evidence_variance = (
-                    max(particles_count / ess0 - 1.0, 0.0) / particles_count
+                    max(particles_count / proposal_ess - 1.0, 0.0)
+                    / particles_count
                 )
+                self.info(
+                    "SMC: proposal ESS %.0f/%d is below the shortcut target; "
+                    "resampling and polishing with one HMC transition at "
+                    "beta=1",
+                    proposal_ess,
+                    particles_count,
+                )
+            else:
+                # The proposal is not good enough to skip HMC. Start tempering
+                # at the furthest point where the weights still have a usable
+                # effective sample; HMC moves what survives, and the initial
+                # ESS is carried in the evidence error rather than hidden.
+                grid = np.linspace(0.0, 1.0, 21)[:-1]
+                ess_grid = np.array(
+                    [
+                        log_ess(log_prior + beta * log_like - log_proposal)
+                        for beta in grid
+                    ]
+                )
+                usable = max(2.0, 0.25 * target_count)
+                qualifying = grid[ess_grid >= usable]
+                beta0 = float(qualifying.max()) if qualifying.size else 0.0
+                if beta0 > 0.0:
+                    start = "laplace"
+                    log_weights = log_prior + beta0 * log_like - log_proposal
+                    log_evidence = float(
+                        scipy_special.logsumexp(log_weights)
+                        - np.log(particles_count)
+                    )
+                    ess0 = log_ess(log_weights)
+                    log_evidence_variance = (
+                        max(particles_count / ess0 - 1.0, 0.0) / particles_count
+                    )
 
         if start == "prior":
             positions = prior_positions_of(prior_key)
@@ -1619,7 +1696,10 @@ class LaplaceOptimizer(Optimizer):
                 remaining,
                 smc_solver.dichotomy,
             )
-            delta = jnp.clip(delta, 0.0, remaining)
+            lower = jnp.minimum(
+                jnp.asarray(self.smc_min_delta, dtype=dtype), remaining
+            )
+            delta = jnp.clip(delta, lower, remaining)
             return smc_kernel(
                 stage_key,
                 state,
@@ -1653,6 +1733,25 @@ class LaplaceOptimizer(Optimizer):
         accepted = 0.0
         ess_value = log_ess(log_weights)
         started = time.perf_counter()
+        if polish:
+            # The particles were resampled from the proposal weights, so they
+            # approximate the posterior; one HMC transition at beta = 1
+            # decorrelates the duplicates without changing the target. The
+            # tempered kernel with a zero increment does exactly that.
+            key, stage_key = jax.random.split(key)
+            step_size = jnp.asarray([np.exp(log_step)], dtype=dtype)
+            state, info = one_stage(
+                stage_key, state, step_size, jnp.asarray(0.0, dtype=dtype)
+            )
+            state, info = jax.block_until_ready((state, info))
+            stage = 1
+            ess_value = 1.0 / float(jnp.sum(state.weights**2))
+            accepted = float(jnp.mean(info.update_info.acceptance_rate))
+            self.info(
+                "SMC: polished the resampled proposal with one HMC transition "
+                "at beta=1 (acceptance %.2f)",
+                accepted,
+            )
         while beta < 1.0 and stage < self.smc_max_steps:
             stage += 1
             key, stage_key = jax.random.split(key)
@@ -1737,6 +1836,7 @@ class LaplaceOptimizer(Optimizer):
             "gradient_evaluations": gradient_evaluations,
             "batch_size": batch,
             "hmc_steps": self.smc_hmc_steps,
+            "polish": polish,
         }
 
         # The particles carry the final weights; the transform is applied to
@@ -2905,9 +3005,12 @@ class LaplaceOptimizer(Optimizer):
             opt.write_scalar("num_particles", self.num_particles)
             opt.write_scalar("num_mcmc_steps", self.num_mcmc_steps)
             opt.write_scalar("smc_target_ess", self.smc_target_ess)
+            opt.write_scalar("smc_polish_ess", self.smc_polish_ess)
             opt.write_scalar("smc_max_delta", self.smc_max_delta)
+            opt.write_scalar("smc_min_delta", self.smc_min_delta)
             opt.write_scalar("smc_hmc_steps", self.smc_hmc_steps)
             opt.write_scalar("smc_fit_tolerance", self.smc_fit_tolerance)
+            opt.write_scalar("smc_max_iterations", self.smc_max_iterations)
             opt.write_string("smc_start", self.smc_start)
             if self._smc_parameters is not None:
                 for name in ("beta0", "proposal_ess", "stages"):
