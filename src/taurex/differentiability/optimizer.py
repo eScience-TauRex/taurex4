@@ -2111,20 +2111,45 @@ class LaplaceOptimizer(Optimizer):
 
         if start == "prior":
             positions = prior_positions_of(prior_key)
-            # the ladder would meet the same values one stage at a time: report
-            # them on the particles it would have started from
-            _sanitise_log_likelihood(
+            prior_like = _sanitise_log_likelihood(
                 likelihood_of(positions),
                 positions,
                 transform_of,
                 "the prior start",
                 self.warning,
             )
-            log_weights = np.zeros(particles_count, dtype=float)
-            beta0 = 0.0
-            log_evidence = 0.0
-            log_evidence_variance = 0.0
+            # Prior draws already carry their likelihood, so the ladder does not
+            # have to start at zero: the same grid search the proposal start
+            # uses finds the furthest temperature whose weights are still
+            # effective, here with the prior cancelling against the proposal.
+            # That is one likelihood sweep against the many stages a ladder from
+            # zero would otherwise spend crawling upwards.
+            grid = np.linspace(0.0, 1.0, 21)[:-1]
+            ess_grid = np.array(
+                [log_ess(np.nan_to_num(beta * prior_like)) for beta in grid]
+            )
+            usable = max(2.0, 0.25 * self.smc_target_ess * particles_count)
+            qualifying = grid[ess_grid >= usable]
+            beta0 = float(qualifying.max()) if qualifying.size else 0.0
+            log_weights = np.nan_to_num(beta0 * prior_like)
+            log_evidence = float(
+                scipy_special.logsumexp(log_weights) - np.log(particles_count)
+            )
+            ess0 = log_ess(log_weights)
+            log_evidence_variance = (
+                max(particles_count / ess0 - 1.0, 0.0) / particles_count
+                if ess0 > 0.0
+                else 0.0
+            )
             proposal_ess = float(particles_count)
+            if beta0 > 0.0:
+                self.info(
+                    "SMC: the prior draws keep ESS %.0f/%d at tempering %.2f, "
+                    "so the ladder starts there instead of at zero",
+                    log_ess(log_weights),
+                    particles_count,
+                    beta0,
+                )
 
         self.info(
             "SMC: starting at tempering %.3f with ESS %.0f/%d (%s start)",
