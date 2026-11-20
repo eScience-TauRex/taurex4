@@ -70,6 +70,15 @@ _SMC_BATCH_BYTES = 4 * 1024 * 1024 * 1024
 _SMC_ARRAYS_PER_PARTICLE = 12
 """Roughly how many ``(nlayers, nwn)`` arrays one particle keeps live."""
 
+_SMC_MAX_VMAP_PARTICLES = 4
+"""Shard size below which particles are moved one at a time.
+
+``vmap`` keeps one model working set live per particle at once, and the HMC
+leapfrogs then run with that whole batch allocated. On a shard of a few
+particles the vmap buys little - XLA runs the batch on one core either way -
+while the multiplier is what decides how many ranks fit on a node.
+"""
+
 _SMC_PROPOSAL_DOF = 4.0
 """Degrees of freedom of the Student-t proposal built from the mode."""
 
@@ -1517,8 +1526,14 @@ class LaplaceOptimizer(Optimizer):
         batch = min(batch, chunk)
         # ``batch_size=0`` asks blackjax for a single vmap over the local
         # chunk, which is the fastest option whenever the memory estimate
-        # allows it.
-        vectorised_batch = 0 if batch >= chunk else batch
+        # allows it. A small shard is the case where it does not: the vmap
+        # keeps one model working set per particle live at once, and on one
+        # core it saves no time, so those shards are evaluated particle by
+        # particle.
+        if chunk <= _SMC_MAX_VMAP_PARTICLES:
+            vectorised_batch = 1
+        else:
+            vectorised_batch = 0 if batch >= chunk else batch
         batched_likelihood = smc_base.map_fn(
             log_likelihood_fn, vectorised_batch
         )
@@ -1559,7 +1574,7 @@ class LaplaceOptimizer(Optimizer):
             size,
             chunk,
             per_particle / 1e6,
-            "all" if vectorised_batch == 0 else str(batch),
+            "all" if vectorised_batch == 0 else str(vectorised_batch),
             self.smc_hmc_steps,
             self.num_mcmc_steps,
         )
@@ -2310,10 +2325,15 @@ class LaplaceOptimizer(Optimizer):
                 )
                 return state.position, jnp.mean(infos.acceptance_rate)
 
-            return jax.vmap(one)(
-                local_positions,
-                jax.random.split(key, local_positions.shape[0]),
-            )
+            keys = jax.random.split(key, local_positions.shape[0])
+            if local_positions.shape[0] <= _SMC_MAX_VMAP_PARTICLES:
+                # one trajectory at a time: the memory of a single model
+                # evaluation rather than one per particle
+                return jax.lax.map(
+                    lambda pair: one(pair[0], pair[1]),
+                    (local_positions, keys),
+                )
+            return jax.vmap(one)(local_positions, keys)
 
         local_transition = jax.jit(local_transition, device=self.device)
 
