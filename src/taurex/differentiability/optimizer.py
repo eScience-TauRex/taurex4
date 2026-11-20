@@ -97,6 +97,41 @@ def _as_bool(value: t.Any) -> bool:
         raise ValueError(f"Cannot read {value!r} as a boolean")
     return bool(value)
 
+def _check_finite_log_likelihood(
+    log_like: npt.NDArray[np.float64],
+    positions: npt.NDArray[np.float64],
+    transform_of: t.Callable[[Array], Array],
+    where: str,
+) -> None:
+    """Fail when the likelihood is not finite on any particle.
+
+    A single ``+inf``, ``-inf`` or ``nan`` log likelihood makes the effective
+    sample size of every tempering stage ``nan``: the increment solver then
+    finds no admissible step, ``beta`` stays where it is, and the run spends
+    every stage drawing from the previous target while the evidence
+    accumulates ``nan``. Such a value has no meaning in a tempered target, so
+    it is reported here together with the parameters that produced it instead
+    of being carried through the schedule.
+    """
+    bad = np.flatnonzero(~np.isfinite(log_like))
+    if bad.size == 0:
+        return
+    theta = np.asarray(
+        transform_of(jnp.asarray(positions[bad], dtype=jnp.float64))
+    )
+    detail = "; ".join(
+        f"particle {int(index)} has log L {float(log_like[index])!r} at "
+        f"parameters {np.array2string(theta[shown], precision=5)}"
+        for shown, index in enumerate(bad[:3])
+    )
+    raise ValueError(
+        f"log likelihood is not finite for {bad.size} of {log_like.size} "
+        f"particles at {where}: {detail}. The model returns nan or overflows "
+        "at those parameters, so no tempered target or evidence exists for "
+        "them; fix the model there instead of adding particles"
+    )
+
+
 _BROADCAST_FIT_FIELDS = (
     "_map",
     "_median",
@@ -1690,6 +1725,9 @@ class LaplaceOptimizer(Optimizer):
                 np.log1p(-_SMC_PRIOR_MIX) + log_t,
             )
             log_like = likelihood_of(positions)
+            _check_finite_log_likelihood(
+                log_like, positions, transform_of, "the proposal start"
+            )
 
             # β = 1 is the posterior itself. If the proposal already carries
             # it, the weighted particles are exact posterior draws and no
@@ -1791,6 +1829,14 @@ class LaplaceOptimizer(Optimizer):
 
         if start == "prior":
             positions = prior_positions_of(prior_key)
+            # the ladder would meet the same non-finite values one stage at a
+            # time: fail on the particles it would have started from
+            _check_finite_log_likelihood(
+                likelihood_of(positions),
+                positions,
+                transform_of,
+                "the prior start",
+            )
             log_weights = np.zeros(particles_count, dtype=float)
             beta0 = 0.0
             log_evidence = 0.0
@@ -1959,6 +2005,19 @@ class LaplaceOptimizer(Optimizer):
 
             beta = float(state.tempering_param)
             increment = float(info.log_likelihood_increment)
+            if not np.isfinite(increment):
+                stage_positions = np.asarray(state.particles)
+                _check_finite_log_likelihood(
+                    likelihood_of(stage_positions),
+                    stage_positions,
+                    transform_of,
+                    f"stage {stage}",
+                )
+                raise ValueError(
+                    f"stage {stage} produced a non-finite log evidence "
+                    f"increment {increment!r} at tempering {beta:.4f} although "
+                    "every particle's log likelihood is finite"
+                )
             log_evidence += increment
 
             # The normalising constant of a stage is estimated from N weighted
@@ -2261,6 +2320,9 @@ class LaplaceOptimizer(Optimizer):
         weights = np.exp(log_weights - scipy_special.logsumexp(log_weights))
         if log_like is None:
             log_like = likelihood_of(positions)
+        _check_finite_log_likelihood(
+            log_like, positions, transform_of, "the starting particles"
+        )
         beta = float(beta0)
         log_z = float(log_evidence)
         log_z_variance = float(log_evidence_variance)
@@ -2323,6 +2385,9 @@ class LaplaceOptimizer(Optimizer):
             )
             positions = gather(np.asarray(local_new))
             log_like = likelihood_of(positions)
+            _check_finite_log_likelihood(
+                log_like, positions, transform_of, f"stage {stage}"
+            )
             log_increment = delta * log_like
             log_z += float(
                 scipy_special.logsumexp(log_increment)

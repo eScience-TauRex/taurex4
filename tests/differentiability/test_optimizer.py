@@ -714,6 +714,29 @@ def test_smc_polishes_a_moderate_proposal_without_tempering(
     assert np.all(np.isfinite(samples))
 
 
+def test_non_finite_log_likelihood_raises_instead_of_tempering():
+    """A nan or infinite log likelihood is reported, not carried into beta.
+
+    One such particle drives the ESS of every stage to nan, which leaves the
+    tempering parameter where it is and turns the evidence into nan; the run
+    has to stop and name the parameters instead.
+    """
+    from taurex.differentiability.optimizer import _check_finite_log_likelihood
+
+    positions = np.zeros((4, 2))
+    log_like = np.array([-3.0, np.nan, -np.inf, 2.0])
+    with pytest.raises(ValueError, match="not finite for 2 of 4 particles"):
+        _check_finite_log_likelihood(log_like, positions, lambda u: u, "stage 1")
+
+    # A finite batch passes and returns nothing.
+    assert (
+        _check_finite_log_likelihood(
+            np.array([-3.0, 2.0]), np.zeros((2, 2)), lambda u: u, "stage 1"
+        )
+        is None
+    )
+
+
 def test_smc_draws_weighted_quantiles_and_bands(taurex_model, observation):
     """The solution interface carries the SMC weights through to the output."""
     optimizer = LaplaceOptimizer(
