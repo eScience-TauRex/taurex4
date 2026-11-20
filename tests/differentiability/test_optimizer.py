@@ -761,6 +761,46 @@ def test_smc_fits_the_mode_with_adam_and_carries_the_metric(
     assert abs(float(optimizer._median[0]) - truth[0]) < 0.02
 
 
+def test_smc_without_a_mode_fit_tempers_from_the_prior(taurex_model, observation):
+    """``smc_fit = none`` skips the mode search and its gradient entirely.
+
+    The run then has to reach the posterior from prior draws alone, which the
+    draws around the injected value show: no fit program and no model gradient
+    is spent, so the compilation that dominated the setup never happens.
+    """
+    optimizer = LaplaceOptimizer(
+        num_samples=64,
+        sampler="smc",
+        smc_fit="none",
+        smc_start="prior",
+        num_mcmc_steps=1,
+        smc_hmc_steps=2,
+        smc_max_delta=0.5,
+        seed=31,
+    )
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    optimizer.enable_fit("planet_radius")
+
+    truth = np.array([1.07])
+    optimizer.update_model(truth)
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    clean = np.asarray(atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64)))
+    generator = np.random.default_rng(8)
+    observation._obs_spectrum[:, 1] = clean + generator.normal(0.0, 1e-4, clean.shape)
+    optimizer.update_model(truth)
+    optimizer.compute_fit()
+
+    assert optimizer.iterations == 0
+    assert optimizer.gradient_evaluations == 0
+    assert optimizer.smc_parameters["start"] == "prior"
+    assert np.isfinite(optimizer.log_evidence)
+    assert np.all(np.isfinite(optimizer.get_samples(0)))
+    assert abs(float(optimizer._median[0]) - truth[0]) < 0.02
+
+
 def test_non_finite_log_likelihood_raises_instead_of_tempering():
     """A nan or infinite log likelihood is reported, not carried into beta.
 

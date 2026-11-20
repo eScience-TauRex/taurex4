@@ -619,7 +619,12 @@ class LaplaceOptimizer(Optimizer):
             difference between minutes and a quarter of an hour of
             compilation. Adam leaves no curvature behind, so the proposal and
             the HMC metric start from the prior and the metric then follows the
-            particles from stage to stage.
+            particles from stage to stage. ``none`` skips the mode search
+            altogether: no fit, no gradient of the model, and therefore no
+            fourteen-minute compilation, because the run tempers from the
+            prior instead (``smc_start = prior``). The draws and the evidence
+            are then built entirely from likelihood evaluations and HMC moves,
+            at the cost of more tempering stages.
 
         smc_target_ess:
             Fraction of the particles the ``smc`` tempering schedule keeps
@@ -745,9 +750,15 @@ class LaplaceOptimizer(Optimizer):
                 f"not {smc_metric!r}"
             )
         self.smc_fit = str(smc_fit).strip().lower()
-        if self.smc_fit not in ("lbfgs", "adam"):
+        if self.smc_fit not in ("lbfgs", "adam", "none"):
             raise ValueError(
-                f"smc_fit must be 'lbfgs' or 'adam', not {smc_fit!r}"
+                "smc_fit must be 'lbfgs', 'adam' or 'none', "
+                f"not {smc_fit!r}"
+            )
+        if self.smc_fit == "none" and self.smc_start != "prior":
+            raise ValueError(
+                "smc_fit = none has no mode to propose from, so smc_start must "
+                f"be 'prior', not {smc_start!r}"
             )
         self.smc_target_ess = float(smc_target_ess)
         if not 0.0 < self.smc_target_ess <= 1.0:
@@ -1256,7 +1267,43 @@ class LaplaceOptimizer(Optimizer):
         # infinite until the fit runs, so the proposal falls back to the
         # Laplace Hessian on any rank that did not fit
         fit_gradient_norm = float("inf")
-        if fit_on_this_rank:
+        # ``smc_fit = none`` has nothing to fit: the run tempers from the prior,
+        # so the mode search, its gradient and the program that compiles it are
+        # all skipped and the input file's point is reported as the map.
+        no_fit = self.sampler == "smc" and self.smc_fit == "none"
+        if fit_on_this_rank and no_fit:
+            started = time.perf_counter()
+            transform_of.lower(u).compile()
+            log_likelihood_of.lower(u[: self._n_physical], data, error).compile()
+            self.compile_time = time.perf_counter() - started
+            self.iterations = 0
+            self.function_evaluations = 0
+            self.gradient_evaluations = 0
+            self.fit_time = 0.0
+            u_map = u
+            theta_full = transform_of(u)
+            self._map = np.asarray(theta_full[: self._n_physical]).copy()
+            if jitter:
+                self._jitter_map = float(theta_full[self._n_physical])
+                error_effective = np.sqrt(
+                    np.asarray(error) ** 2 + self._jitter_map**2
+                )
+            else:
+                self._jitter_map = None
+                error_effective = error
+            self._log_likelihood = float(
+                log_likelihood_of(
+                    theta_full[: self._n_physical], data, error_effective
+                )
+            )
+            self._log_posterior = -float(objective(u))
+            self.info(
+                "SMC: no mode fit (smc_fit = none): the run tempers from the "
+                "prior and the reported map is the input file's point at "
+                "log L %.2f",
+                self._log_likelihood,
+            )
+        elif fit_on_this_rank:
             # Tracing and compiling is a one off cost that no eager
             # implementation pays, so it is measured separately and reported:
             # it is paid once per fit here and once per process if the
@@ -1293,10 +1340,13 @@ class LaplaceOptimizer(Optimizer):
             self.gradient_evaluations = int(steps)
             fit_gradient_norm = float(gradient_norm)
             # Compiling the fit graph is the longest single compile of the run
-            # and XLA warns on it; saying what it cost, and whether the fit then
-            # converged, separates "slow compiler" from "slow model".
+            # and XLA warns on it; saying what it cost, on which rank, and
+            # whether the fit then converged separates "slow compiler" from
+            # "slow model" and shows whether more than one rank is fitting.
             self.info(
-                "Mode fit: %d steps in %.0f s after %.0f s of compilation%s",
+                "Mode fit on rank %d: %d steps in %.0f s after %.0f s of "
+                "compilation%s",
+                rank,
                 self.iterations,
                 self.fit_time,
                 self.compile_time,
@@ -1376,14 +1426,14 @@ class LaplaceOptimizer(Optimizer):
                             fit_gradient_norm,
                             fit_tolerance,
                         )
-                if covariance_u is None and self.smc_fit == "adam":
+                if covariance_u is None and self.smc_fit in ("adam", "none"):
                     # No Hessian and no L-BFGS history: the proposal starts from
                     # the prior scale in unconstrained space, where it is the
                     # unit matrix, and the particles carry the metric from
                     # stage to stage.
                     covariance_u = np.eye(u.shape[0])
                     self.info(
-                        "SMC: no curvature from the Adam fit, so the proposal "
+                        "SMC: no curvature from the mode fit, so the proposal "
                         "and the first stages use the prior scale and the HMC "
                         "metric follows the particles"
                     )
