@@ -88,6 +88,14 @@ _SMC_PRIOR_MIX = 0.1
 _SMC_TARGET_ACCEPT = 0.8
 """HMC acceptance rate the step size of the SMC inner kernel aims for."""
 
+_SMC_ADAM_STEP = 0.05
+"""Adam step of the mode fit when ``smc_fit = adam``.
+
+The fit runs in unconstrained space, where the prior is a standard normal, so
+a coordinate step of a few hundredths crosses the prior in the sixty steps an
+SMC fit is allowed.
+"""
+
 
 def _as_bool(value: t.Any) -> bool:
     """Read an option the input file hands over as text.
@@ -381,6 +389,8 @@ class LaplaceOptimizer(Optimizer):
         num_mcmc_steps: t.Optional[int] = 1,
         smc_hmc_steps: t.Optional[int] = 3,
         smc_start: t.Optional[str] = "laplace",
+        smc_metric: t.Optional[str] = "auto",
+        smc_fit: t.Optional[str] = "lbfgs",
         smc_target_ess: t.Optional[float] = 0.5,
         smc_polish_ess: t.Optional[float] = 0.15,
         smc_max_delta: t.Optional[float] = 0.5,
@@ -587,6 +597,30 @@ class LaplaceOptimizer(Optimizer):
             slower but can find a posterior mode the mode search never
             reached, and is the right choice when multi-modality is suspected.
 
+        smc_metric:
+            Where the proposal and the HMC metric of the ``smc`` sampler come
+            from. ``auto`` (default) uses the inverse Hessian that the mode fit
+            already accumulated in its L-BFGS updates when the fit converged,
+            and computes the Laplace Hessian only when it has not: the Hessian
+            costs one model gradient per fitted parameter, the most expensive
+            step of the setup, while a converged fit describes the curvature
+            well enough to propose from. ``hessian`` always computes it and
+            ``lbfgs`` always uses the fit's own approximation. The proposal ESS
+            in the log says whether the approximation held.
+
+        smc_fit:
+            How the ``smc`` sampler finds the mode it proposes from. ``lbfgs``
+            (default) is the quasi-Newton fit with a line search, and it leaves
+            an inverse-Hessian approximation behind that ``smc_metric = auto``
+            proposes from. ``adam`` replaces it with plain Adam steps: the
+            compiled program is then the model forward and backward plus
+            elementwise updates, instead of a loop around a nested line search
+            that traces the model again, which on a large atmosphere is the
+            difference between minutes and a quarter of an hour of
+            compilation. Adam leaves no curvature behind, so the proposal and
+            the HMC metric start from the prior and the metric then follows the
+            particles from stage to stage.
+
         smc_target_ess:
             Fraction of the particles the ``smc`` tempering schedule keeps
             effective at the end of a stage, and the fraction the initial
@@ -594,7 +628,6 @@ class LaplaceOptimizer(Optimizer):
             tempering increment is the largest one that leaves this fraction
             of the particles effective; a smaller value takes fewer, larger
             stages and a larger value takes more, smaller ones.
-
         smc_polish_ess:
             Fraction of the particles the proposal must keep for ``smc`` to
             accept it with one HMC polish at ``beta = 1`` instead of
@@ -704,6 +737,17 @@ class LaplaceOptimizer(Optimizer):
         if self.smc_start not in ("laplace", "prior"):
             raise ValueError(
                 f"smc_start must be 'laplace' or 'prior', not {smc_start!r}"
+            )
+        self.smc_metric = str(smc_metric).strip().lower()
+        if self.smc_metric not in ("auto", "hessian", "lbfgs"):
+            raise ValueError(
+                "smc_metric must be 'auto', 'hessian' or 'lbfgs', "
+                f"not {smc_metric!r}"
+            )
+        self.smc_fit = str(smc_fit).strip().lower()
+        if self.smc_fit not in ("lbfgs", "adam"):
+            raise ValueError(
+                f"smc_fit must be 'lbfgs' or 'adam', not {smc_fit!r}"
             )
         self.smc_target_ess = float(smc_target_ess)
         if not 0.0 < self.smc_target_ess <= 1.0:
@@ -1132,6 +1176,58 @@ class LaplaceOptimizer(Optimizer):
                 scores[best],
             )
 
+        def run_starts_adam(starts: Array) -> t.Tuple[t.Any, ...]:
+            """Fit every starting point with Adam instead of L-BFGS.
+
+            Adam needs no line search and keeps no curvature history, so the
+            program that gets compiled is the model forward and backward plus
+            elementwise updates, rather than a loop around a nested search that
+            traces the model again. That nesting is what makes the L-BFGS
+            program take a quarter of an hour to compile on a large atmosphere.
+
+            Parameters
+            ----------
+            starts:
+                Unconstrained starting points
+
+            Returns
+            -------
+            :obj:`tuple`
+                Best point, ``None`` for the missing curvature state, its
+                gradient norm, the steps taken, no line-search trials, and its
+                objective
+            """
+            solver = optax.adam(_SMC_ADAM_STEP)
+
+            def one_start(u0: Array) -> t.Tuple[Array, Array, Array]:
+                def body(_: t.Any, carry: t.Any) -> t.Any:
+                    point, state = carry
+                    updates, state = solver.update(
+                        jax.grad(objective)(point), state, point
+                    )
+                    return optax.apply_updates(point, updates), state
+
+                point, _ = jax.lax.fori_loop(
+                    0, fit_iterations, body, (u0, solver.init(u0))
+                )
+                gradient = jax.grad(objective)(point)
+                return (
+                    point,
+                    jnp.linalg.norm(gradient, ord=jnp.inf),
+                    objective(point),
+                )
+
+            u_maps, gradient_norms, scores = jax.lax.map(one_start, starts)
+            best = jnp.argmin(scores)
+            return (
+                u_maps[best],
+                None,
+                gradient_norms[best],
+                jnp.asarray(fit_iterations, dtype=jnp.int32),
+                jnp.zeros((), dtype=jnp.int32),
+                scores[best],
+            )
+
         if self.n_starts > 1:
             key = jax.random.PRNGKey(0 if self.seed is None else int(self.seed))
             noise = jax.random.normal(key, (self.n_starts, u.shape[0]), dtype=dtype)
@@ -1150,10 +1246,16 @@ class LaplaceOptimizer(Optimizer):
             return atmosphere.log_likelihood(theta, data=obs, error=err)
 
         log_likelihood_of = jax.jit(log_like_of, device=self.device)
-        solve = jax.jit(run_starts, device=self.device)
+        solve = jax.jit(
+            run_starts if self.smc_fit == "lbfgs" else run_starts_adam,
+            device=self.device,
+        )
 
         u_map: t.Optional[Array] = None
         lbfgs_state: t.Any = None
+        # infinite until the fit runs, so the proposal falls back to the
+        # Laplace Hessian on any rank that did not fit
+        fit_gradient_norm = float("inf")
         if fit_on_this_rank:
             # Tracing and compiling is a one off cost that no eager
             # implementation pays, so it is measured separately and reported:
@@ -1189,6 +1291,19 @@ class LaplaceOptimizer(Optimizer):
             self.iterations = int(steps)
             self.function_evaluations = int(steps + trials)
             self.gradient_evaluations = int(steps)
+            fit_gradient_norm = float(gradient_norm)
+            # Compiling the fit graph is the longest single compile of the run
+            # and XLA warns on it; saying what it cost, and whether the fit then
+            # converged, separates "slow compiler" from "slow model".
+            self.info(
+                "Mode fit: %d steps in %.0f s after %.0f s of compilation%s",
+                self.iterations,
+                self.fit_time,
+                self.compile_time,
+                ""
+                if fit_gradient_norm <= fit_tolerance
+                else " (stopped at the step limit)",
+            )
             if self.iterations >= fit_iterations and (
                 float(gradient_norm) > fit_tolerance
             ):
@@ -1232,21 +1347,60 @@ class LaplaceOptimizer(Optimizer):
         if self.sampler == "smc":
             if fit_on_this_rank:
                 # The mode and its covariance are the proposal for the
-                # particles, so the Hessian is needed even when the run ends in
+                # particles, so a covariance is needed even when the run ends in
                 # the importance-sampling shortcut and never takes a gradient.
-                nuts_hessian_of = jax.jit(
-                    jax.hessian(nuts_objective), device=self.device
-                )
-                covariance, variance_scale = self._laplace_covariance(
-                    nuts_hessian_of, u_map
-                )
-                covariance_u = covariance * variance_scale
-                self._u_covariance = covariance_u
+                # The Hessian costs one model gradient per fitted parameter -
+                # the most expensive step of the setup - and a converged fit
+                # already carries an inverse-Hessian approximation from its own
+                # updates, so that one is used first and the Hessian is only
+                # computed when the fit did not converge or its history is
+                # unusable. The proposal ESS in the log says whether the
+                # approximation held.
+                covariance_u = None
                 lbfgs_covariance = None
-                if not self._is_usable_covariance(covariance_u):
-                    lbfgs_covariance = self._lbfgs_covariance(
-                        lbfgs_state, u.shape[0]
+                if self.smc_metric != "hessian" and lbfgs_state is not None:
+                    candidate = self._lbfgs_covariance(lbfgs_state, u.shape[0])
+                    if candidate is not None and (
+                        self.smc_metric == "lbfgs"
+                        or (
+                            fit_gradient_norm <= fit_tolerance
+                            and self._is_usable_covariance(candidate)
+                        )
+                    ):
+                        covariance_u = candidate
+                        lbfgs_covariance = candidate
+                        self.info(
+                            "SMC: proposal and metric from the L-BFGS inverse "
+                            "Hessian (fit gradient norm %.2e, tolerance %.2e), "
+                            "so the Laplace Hessian is not computed",
+                            fit_gradient_norm,
+                            fit_tolerance,
+                        )
+                if covariance_u is None and self.smc_fit == "adam":
+                    # No Hessian and no L-BFGS history: the proposal starts from
+                    # the prior scale in unconstrained space, where it is the
+                    # unit matrix, and the particles carry the metric from
+                    # stage to stage.
+                    covariance_u = np.eye(u.shape[0])
+                    self.info(
+                        "SMC: no curvature from the Adam fit, so the proposal "
+                        "and the first stages use the prior scale and the HMC "
+                        "metric follows the particles"
                     )
+                if covariance_u is None:
+                    nuts_hessian_of = jax.jit(
+                        jax.hessian(nuts_objective), device=self.device
+                    )
+                    covariance, variance_scale = self._laplace_covariance(
+                        nuts_hessian_of, u_map
+                    )
+                    covariance_u = covariance * variance_scale
+                    if not self._is_usable_covariance(covariance_u):
+                        if lbfgs_state is not None:
+                            lbfgs_covariance = self._lbfgs_covariance(
+                                lbfgs_state, u.shape[0]
+                            )
+                self._u_covariance = covariance_u
             else:
                 covariance_u = None
                 lbfgs_covariance = None
@@ -1897,12 +2051,14 @@ class LaplaceOptimizer(Optimizer):
             state: t.Any,
             logdensity_fn: t.Callable[[Array], Array],
             step_size: Array,
+            metric: Array,
         ) -> t.Tuple[t.Any, t.Any]:
             """One fixed-length HMC transition.
 
-            The inverse mass matrix is closed over instead of passed as an
-            MCMC parameter: it is constant, so keeping it in the trace would
-            make the kernel recompute its factorisation on every call.
+            The inverse mass matrix arrives through the kernel's MCMC parameters,
+            not as a closure: the metric follows the particles from stage to
+            stage, and a closed over one would be traced into the program and
+            force a compilation every time it changed.
 
             Returns
             -------
@@ -1930,13 +2086,14 @@ class LaplaceOptimizer(Optimizer):
         # ``ess_solver`` multiplies this by the particle count, so it is the
         # fraction of the particles that must stay effective, not a count.
         target_ess = self.smc_target_ess
-        metric = jnp.asarray(covariance_np, dtype=dtype)
+        metric_np = np.asarray(covariance_np, dtype=float)
 
         def one_stage(
             stage_key: Array,
             state: t.Any,
             step_size: Array,
             remaining: Array,
+            metric: Array,
         ) -> t.Tuple[t.Any, t.Any]:
             """Advance the particles by one adaptive tempering stage."""
             delta = smc_ess.ess_solver(
@@ -1957,6 +2114,7 @@ class LaplaceOptimizer(Optimizer):
                 state.tempering_param + delta,
                 {
                     "step_size": step_size,
+                    "metric": metric[None],
                 },
             )
 
@@ -1991,7 +2149,11 @@ class LaplaceOptimizer(Optimizer):
             key, stage_key = jax.random.split(key)
             step_size = jnp.asarray([np.exp(log_step)], dtype=dtype)
             state, info = one_stage(
-                stage_key, state, step_size, jnp.asarray(0.0, dtype=dtype)
+                stage_key,
+                state,
+                step_size,
+                jnp.asarray(0.0, dtype=dtype),
+                jnp.asarray(metric_np, dtype=dtype),
             )
             state, info = jax.block_until_ready((state, info))
             stage = 1
@@ -2013,7 +2175,13 @@ class LaplaceOptimizer(Optimizer):
                 min(self.smc_max_delta, 1.0 - beta), dtype=dtype
             )
             step_size = jnp.asarray([np.exp(log_step)], dtype=dtype)
-            state, info = one_stage(stage_key, state, step_size, remaining)
+            state, info = one_stage(
+                stage_key,
+                state,
+                step_size,
+                remaining,
+                jnp.asarray(metric_np, dtype=dtype),
+            )
             # Waiting here makes the timings meaningful and the numbers below
             # readable; the state is needed by the next stage anyway.
             state, info = jax.block_until_ready((state, info))
@@ -2039,6 +2207,15 @@ class LaplaceOptimizer(Optimizer):
             # particles, so its relative variance is (N / ESS - 1) / N. The
             # stage estimates multiply, which adds their log variances.
             ess_value = 1.0 / float(jnp.sum(state.weights**2))
+            # The metric follows the population: with the weights of the stage
+            # that just finished, the particle covariance describes the target
+            # the next stage has to move on, and it costs one small numpy
+            # reduction per stage rather than a Hessian.
+            metric_np = self._particle_metric(
+                np.asarray(state.particles),
+                np.asarray(state.weights),
+                metric_np,
+            )
             log_evidence_variance += max(
                 particles_count / max(ess_value, 1.0) - 1.0, 0.0
             ) / particles_count
@@ -2292,13 +2469,14 @@ class LaplaceOptimizer(Optimizer):
             return low
 
         raw_hmc = hmc_kernel.build_kernel()
-        metric = jnp.asarray(covariance_np, dtype=dtype)
+        metric_np = np.asarray(covariance_np, dtype=float)
 
         def local_transition(
             key: Array,
             local_positions: Array,
             beta: Array,
             step_size: Array,
+            metric: Array,
         ) -> t.Tuple[Array, Array]:
             """Move this rank's shard with fixed-length HMC transitions."""
 
@@ -2337,6 +2515,38 @@ class LaplaceOptimizer(Optimizer):
 
         local_transition = jax.jit(local_transition, device=self.device)
 
+        # Every rank compiles the same likelihood map and HMC kernel. With a
+        # persistent cache one compile serves the whole job, but only if the
+        # ranks wait for it: started together they each compile the same
+        # programs, which is minutes of duplicated work and the peak memory of a
+        # many-rank job. Without a cache there is nothing to share, so the wait
+        # is skipped rather than serialising the compiles. The warm-up stays
+        # local, because the collective ``likelihood_of`` needs every rank.
+        cache_dir = jax.config.jax_compilation_cache_dir
+        if cache_dir:
+            if rank == 0:
+                compile_started = time.perf_counter()
+                jax.block_until_ready(
+                    batched_likelihood(jnp.asarray(positions[local_slice]))
+                )
+                jax.block_until_ready(
+                    local_transition(
+                        jax.random.PRNGKey(0),
+                        jnp.asarray(positions[local_slice]),
+                        jnp.asarray(beta0, dtype=dtype),
+                        jnp.asarray(self.smc_step_size),
+                        jnp.asarray(metric_np, dtype=dtype),
+                    )
+                )
+                self.info(
+                    "SMC: compiled the likelihood and HMC programs once on "
+                    "rank 0 in %.0f s; the other %d rank(s) read them from %s",
+                    time.perf_counter() - compile_started,
+                    size - 1,
+                    cache_dir,
+                )
+            comm.Barrier()
+
         weights = np.exp(log_weights - scipy_special.logsumexp(log_weights))
         if log_like is None:
             log_like = likelihood_of(positions)
@@ -2368,6 +2578,7 @@ class LaplaceOptimizer(Optimizer):
                 jnp.asarray(positions[local_slice]),
                 jnp.asarray(1.0, dtype=dtype),
                 step_size,
+                jnp.asarray(metric_np, dtype=dtype),
             )
             positions = gather(np.asarray(local_new))
             weights = np.full(particles_count, 1.0 / particles_count)
@@ -2402,6 +2613,7 @@ class LaplaceOptimizer(Optimizer):
                 jnp.asarray(positions[local_slice]),
                 jnp.asarray(beta, dtype=dtype),
                 step_size,
+                jnp.asarray(metric_np, dtype=dtype),
             )
             positions = gather(np.asarray(local_new))
             log_like = likelihood_of(positions)
@@ -2417,6 +2629,9 @@ class LaplaceOptimizer(Optimizer):
                 log_increment - scipy_special.logsumexp(log_increment)
             )
             ess_value = 1.0 / float(np.sum(weights**2))
+            # the metric follows the population, which is global here: no
+            # communication, and no Hessian
+            metric_np = self._particle_metric(positions, weights, metric_np)
             log_z_variance += (
                 max(particles_count / max(ess_value, 1.0) - 1.0, 0.0)
                 / particles_count
@@ -3274,6 +3489,46 @@ class LaplaceOptimizer(Optimizer):
     def fisher(self) -> t.Optional[npt.NDArray[np.float64]]:
         """Cached Fisher information, filled in by :meth:`fisher_information`."""
         return self._fisher
+
+    @staticmethod
+    def _particle_metric(
+        positions: t.Any,
+        weights: t.Any,
+        previous: np.ndarray,
+    ) -> np.ndarray:
+        """Inverse mass matrix from the weighted particle population.
+
+        A population metric describes where the next stage has to move rather
+        than the curvature at one point: it narrows as tempering narrows the
+        target, and it needs neither a Hessian nor an L-BFGS history, which is
+        what lets ``smc_fit = adam`` stand in for the quasi-Newton fit. A
+        degenerate population leaves the previous metric in place.
+
+        Parameters
+        ----------
+        positions:
+            Particles in unconstrained space, one row each
+
+        weights:
+            Normalised weights of those particles
+
+        previous:
+            Metric to keep when the population has no spread
+
+        Returns
+        -------
+        :obj:`numpy.ndarray`
+            Positive definite inverse mass matrix
+        """
+        population = np.asarray(positions, dtype=float)
+        covariance = np.atleast_2d(
+            np.cov(population, rowvar=False, aweights=np.asarray(weights))
+        )
+        covariance = 0.5 * (covariance + covariance.T)
+        covariance = covariance + 1e-6 * np.eye(covariance.shape[0])
+        if not LaplaceOptimizer._is_usable_covariance(covariance):
+            return previous
+        return covariance
 
     @staticmethod
     def _is_usable_covariance(covariance: t.Any) -> bool:

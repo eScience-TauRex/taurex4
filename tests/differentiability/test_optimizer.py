@@ -714,6 +714,53 @@ def test_smc_polishes_a_moderate_proposal_without_tempering(
     assert np.all(np.isfinite(samples))
 
 
+def test_smc_fits_the_mode_with_adam_and_carries_the_metric(
+    taurex_model, observation
+):
+    """Adam replaces the quasi-Newton fit, and the particles supply the metric.
+
+    Without an L-BFGS history there is no covariance to propose from, so the
+    run starts on the prior scale and the HMC metric has to follow the
+    population. The draws still have to describe the posterior, which is what
+    the tempered draws around the injected value show.
+    """
+    optimizer = LaplaceOptimizer(
+        num_samples=64,
+        sampler="smc",
+        smc_fit="adam",
+        smc_max_iterations=40,
+        num_mcmc_steps=1,
+        smc_hmc_steps=2,
+        smc_max_delta=0.5,
+        seed=29,
+    )
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    optimizer.enable_fit("planet_radius")
+
+    truth = np.array([1.07])
+    optimizer.update_model(truth)
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    clean = np.asarray(atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64)))
+    generator = np.random.default_rng(7)
+    observation._obs_spectrum[:, 1] = clean + generator.normal(0.0, 1e-4, clean.shape)
+    optimizer.update_model(truth)
+    optimizer.compute_fit()
+
+    # Adam runs exactly the steps it is given and leaves no curvature behind.
+    assert optimizer.iterations == 40
+    assert np.all(np.isfinite(optimizer._u_covariance))
+    samples = optimizer.get_samples(0)
+    weights = optimizer.get_weights(0)
+    assert np.all(np.isfinite(samples))
+    assert float(weights.sum()) == pytest.approx(1.0)
+    assert optimizer.log_evidence is not None
+    assert np.isfinite(optimizer.log_evidence)
+    assert abs(float(optimizer._median[0]) - truth[0]) < 0.02
+
+
 def test_non_finite_log_likelihood_raises_instead_of_tempering():
     """A nan or infinite log likelihood is reported, not carried into beta.
 
