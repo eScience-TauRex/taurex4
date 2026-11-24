@@ -20,6 +20,12 @@ the reverse pass over a reverse pass that differentiating a gradient would cost.
 A fit is therefore a handful of XLA programs with no python callback between
 them.
 
+What happens after the mode is chosen depends on the ``sampler`` option:
+``laplace`` draws from the Gaussian, ``importance`` reweights Student-t
+proposals, ``nuts`` and ``mclmc`` run exact and microcanonical chains, and
+``smc`` tempers a particle population and returns the evidence alongside the
+posterior.
+
 The quasi-Newton step itself is :func:`optax.lbfgs`, an L-BFGS with a
 strong-Wolfe zoom line search, which is the same algorithm the torch
 implementation used. It is used rather than :func:`jax.scipy.optimize.minimize`
@@ -43,6 +49,7 @@ from taurex.core.priors import Gaussian
 from taurex.core.priors import Prior
 from taurex.core.priors import Uniform
 from taurex.model import ForwardModel
+from taurex.optimizer.optimizer import AUTO_LOG_DECADES
 from taurex.optimizer.optimizer import Optimizer
 from taurex.spectrum import BaseSpectrum
 from taurex.util import quantile_corner
@@ -88,6 +95,15 @@ _SMC_PRIOR_MIX = 0.1
 _SMC_TARGET_ACCEPT = 0.8
 """HMC acceptance rate the step size of the SMC inner kernel aims for."""
 
+_SMC_MAX_KHAT = 0.7
+"""Largest weight tail index whose importance estimate is trusted.
+
+A generalised Pareto fit to the largest importance weights gives the tail
+index ``k``. ``k >= 0.7`` means the estimate is dominated by a handful of
+draws (Vehtari et al. 2024), so the shortcut is refused and the particles are
+tempered instead.
+"""
+
 _SMC_ADAM_STEP = 0.05
 """Adam step of the mode fit when ``smc_fit = adam``.
 
@@ -113,6 +129,57 @@ def _as_bool(value: t.Any) -> bool:
             return False
         raise ValueError(f"Cannot read {value!r} as a boolean")
     return bool(value)
+
+
+def _pareto_khat(log_weights: npt.NDArray[np.float64]) -> float:
+    """Tail index of the importance weights.
+
+    The weights of a proposal are reliable only while their largest values do
+    not carry the estimate. Following Pareto-smoothed importance sampling
+    (Vehtari, Simpson, Gelman, Yao and Gabry 2024), a generalised Pareto
+    distribution is fitted to the ``min(N/5, 3 sqrt(N))`` largest weights: a
+    shape ``k < 0.5`` has a finite variance, ``0.5 <= k < 0.7`` is usable with
+    a large Monte Carlo error, and ``k >= 0.7`` means a few particles decide
+    the answer. The fit is a diagnostic, not a correction: the caller refuses
+    the importance estimate above the limit and tempers instead.
+
+    Parameters
+    ----------
+    log_weights:
+        Unnormalised log weights, one per particle
+
+    Returns
+    -------
+    float
+        The fitted shape parameter, or ``inf`` when the sample is too small or
+        the fit is not finite
+    """
+    from scipy.stats import genpareto
+
+    values = np.asarray(log_weights, dtype=float)
+    finite = values[np.isfinite(values)]
+    count = finite.size
+    cut = min(count // 5, int(3.0 * np.sqrt(count)))
+    if cut < 5:
+        return float("inf")
+    tail = np.sort(finite)[-cut:]
+    # The generalised Pareto is fitted to the ratios, not to their logarithms:
+    # a Pareto tail of index k in the weights is an exponential tail in the
+    # log weights, whose fitted shape would be zero whatever the weights do.
+    # The threshold is the smallest ratio of the tail, so the excesses start
+    # at zero and ``floc = 0`` is exact. A spread of more than e^50 between
+    # the smallest and largest tail weight is already past any usable index,
+    # and exponentiating it would overflow.
+    if float(tail[-1] - tail[0]) > 50.0:
+        return float("inf")
+    excess = np.exp(tail - tail[0]) - 1.0
+    if not np.all(np.isfinite(excess)) or excess[-1] <= 0.0:
+        return 0.0
+    shape, _, scale = genpareto.fit(excess, floc=0.0)
+    if not np.isfinite(shape) or not np.isfinite(scale) or scale <= 0.0:
+        return float("inf")
+    return float(shape)
+
 
 def _sanitise_log_likelihood(
     log_like: npt.NDArray[np.float64],
@@ -205,6 +272,7 @@ _BROADCAST_FIT_FIELDS = (
     "_log_evidence_error",
     "_smc_parameters",
     "_nuts_parameters",
+    "_pilot_parameters",
     "iterations",
     "function_evaluations",
     "gradient_evaluations",
@@ -438,6 +506,9 @@ class LaplaceOptimizer(Optimizer):
         smc_max_steps: t.Optional[int] = 50,
         smc_step_size: t.Optional[float] = 0.5,
         smc_batch_size: t.Optional[int] = None,
+        pilot_warmup: t.Optional[int] = 75,
+        pilot_samples: t.Optional[int] = 0,
+        pilot_blend: t.Optional[float] = None,
         jitter: t.Optional[bool] = False,
         jitter_scale: t.Optional[float] = None,
         **kwargs: t.Any,
@@ -535,7 +606,12 @@ class LaplaceOptimizer(Optimizer):
             costs one forward pass per proposal and no gradients, and the
             effective sample size it reports says how much of the posterior
             the Gaussian captured: high means the Laplace description was
-            right, low means neither it nor these draws can be trusted.
+            right, low means neither it nor these draws can be trusted. The
+            proposals are returned with their weights, so the reported
+            quantiles and covariance use the importance weights instead of
+            pretending the proposals are independent; the Pareto tail index
+            ``k-hat`` is reported and warns above 0.7, where a few proposals
+            decide the answer.
             ``mclmc`` runs Microcanonical Langevin Monte Carlo from
             :mod:`blackjax`, which produces one sample per gradient rather
             than the tens to hundreds a NUTS trajectory needs, and needs no
@@ -558,7 +634,10 @@ class LaplaceOptimizer(Optimizer):
             proposal gets wrong is corrected by tempering and HMC. It also has
             a prior start, which reaches a second mode that the mode search
             never found, but pays for that with far more stages. The evidence
-            is returned as ``log_evidence``. It requires
+            is returned as ``log_evidence``. The zero-gradient shortcut is
+            taken only when the proposal weights also pass a Pareto
+            tail-index check (``k-hat <= 0.7``); a proposal whose largest
+            weights decide the answer is tempered instead. It requires
             ``blackjax >= 1.7``.
 
         n_starts:
@@ -717,6 +796,27 @@ class LaplaceOptimizer(Optimizer):
             faster on a GPU and costs memory; ``num_particles`` maps all
             particles at once.
 
+        pilot_warmup:
+            Warm-up steps of the short NUTS pilot that corrects the Laplace
+            covariance (default 75). The pilot starts at the mode in the
+            Laplace whitened coordinates. It is off while ``pilot_samples`` is
+            zero. For ``smc`` it adds a NUTS compile, so it is a warm-cache or
+            quality choice, not a first-cold-run one.
+
+        pilot_samples:
+            Number of NUTS draws in that pilot (default 0, disabled). The
+            pilot covariance is blended with the Laplace one and used as the
+            proposal and initial metric by ``smc``, and as the initial
+            whitening of ``nuts``. A sample covariance from N draws in d
+            dimensions is noisy and rank deficient when d >= N; the blend with
+            the Laplace covariance is the shrinkage that keeps it positive
+            definite.
+
+        pilot_blend:
+            Weight of the Laplace covariance in that blend, in [0, 1].``None``
+            (default) uses ``d / (d + pilot_samples)``, clamped to [0.1, 0.9],
+            so a short pilot in many dimensions leans on the Laplace metric.
+
         jitter:
             When True an extra nuisance coordinate is fitted: the per-bin
             errors become ``sqrt(error^2 + jitter^2)``. This is how a
@@ -832,6 +932,18 @@ class LaplaceOptimizer(Optimizer):
             raise ValueError(
                 f"smc_batch_size must be positive, not {smc_batch_size!r}"
             )
+        self.pilot_warmup = max(1, int(pilot_warmup))
+        self.pilot_samples = max(0, int(pilot_samples))
+        if self.pilot_samples == 1:
+            raise ValueError(
+                "pilot_samples must be 0 or at least 2, because a covariance "
+                "needs more than one draw"
+            )
+        self.pilot_blend = None if pilot_blend is None else float(pilot_blend)
+        if self.pilot_blend is not None and not 0.0 <= self.pilot_blend <= 1.0:
+            raise ValueError(
+                f"pilot_blend must lie in [0, 1], not {pilot_blend!r}"
+            )
         self.jitter = _as_bool(jitter)
         self.jitter_scale = None if jitter_scale is None else float(jitter_scale)
 
@@ -852,6 +964,7 @@ class LaplaceOptimizer(Optimizer):
         self._log_evidence_error: t.Optional[float] = None
         self._smc_parameters: t.Optional[t.Dict[str, t.Any]] = None
         self._nuts_parameters: t.Optional[t.Dict[str, t.Any]] = None
+        self._pilot_parameters: t.Optional[t.Dict[str, t.Any]] = None
 
         self.iterations: t.Optional[int] = None
         self.function_evaluations: t.Optional[int] = None
@@ -935,12 +1048,36 @@ class LaplaceOptimizer(Optimizer):
                 "fit. Add entries under [Fitting] in the input file."
             )
 
+        # A uniform prior over many decades is the most common way to make a
+        # differentiable retrieval ill-conditioned: the sigmoid saturates where
+        # the parameter lives, so d theta / d u vanishes and the Hessian, the
+        # Laplace metric and the HMC step size all describe the wrong scale.
+        # ``mode = auto`` fixes it; this only points at the parameters that
+        # would benefit, without changing the target behind the user's back.
+        if rank == 0:
+            for param in fit_params:
+                if param.prior is not None or param.mode != "linear":
+                    continue
+                low, high = param.boundaries
+                low, high = min(low, high), max(low, high)
+                if low > 0.0 and high / low > 10.0**AUTO_LOG_DECADES:
+                    self.warning(
+                        "Parameter %s is fitted linearly over %.1f decades "
+                        "(%.2e to %.2e); mode = auto (or log) would condition "
+                        "the sampler better",
+                        param.name,
+                        float(np.log10(high / low)),
+                        low,
+                        high,
+                    )
+
         # A second fit on the same object must not inherit the weights or the
         # evidence of the first one, which a different sampler may not set.
         self._weights = None
         self._log_evidence = None
         self._log_evidence_error = None
         self._smc_parameters = None
+        self._pilot_parameters = None
 
         dtype = jnp.float64
         atmosphere = Atmosphere(
@@ -1567,6 +1704,18 @@ class LaplaceOptimizer(Optimizer):
                     hessian_of, u_map
                 )
             self._u_covariance = covariance * variance_scale
+            if self.sampler == "nuts" and self.pilot_samples > 0:
+                scale = float(variance_scale)
+                if scale > 0.0:
+                    pilot_covariance, pilot_info = self._pilot_covariance(
+                        nuts_objective,
+                        u_map,
+                        np.asarray(covariance) * scale,
+                    )
+                    if pilot_covariance is not None:
+                        covariance = pilot_covariance / scale
+                        self._u_covariance = pilot_covariance
+                        self._pilot_parameters = pilot_info
             if self.sampler != "laplace":
                 if self.sampler == "nuts":
                     self._samples = self._run_nuts(
@@ -1577,7 +1726,7 @@ class LaplaceOptimizer(Optimizer):
                         transform_of,
                     )
                 elif self.sampler == "importance":
-                    self._samples = self._run_importance_sampling(
+                    self._samples, self._weights = self._run_importance_sampling(
                         nuts_objective,
                         u_map,
                         covariance,
@@ -1592,18 +1741,43 @@ class LaplaceOptimizer(Optimizer):
                         variance_scale,
                         transform_of,
                     )
-                # These samplers produce independent draws, so the weights are
-                # uniform and are reported as such.
-                self._weights = None
-                self._median = np.median(self._samples, axis=0)
-                if self._samples.shape[0] > 1:
-                    self._covariance = np.atleast_2d(
-                        np.cov(self._samples, rowvar=False)
-                    )
+                # NUTS and MCLMC draw from the posterior itself, so their
+                # draws carry equal weight. Importance sampling returns the
+                # weights of its proposals instead, because resampling them
+                # would make the reported errors too small.
+                if self._weights is None:
+                    self._median = np.median(self._samples, axis=0)
+                    if self._samples.shape[0] > 1:
+                        self._covariance = np.atleast_2d(
+                            np.cov(self._samples, rowvar=False)
+                        )
+                    else:
+                        self._covariance = np.zeros(
+                            (self._n_physical, self._n_physical), dtype=float
+                        )
                 else:
-                    self._covariance = np.zeros(
-                        (self._n_physical, self._n_physical), dtype=float
+                    self._median = np.array(
+                        [
+                            quantile_corner(
+                                self._samples[:, index],
+                                [0.5],
+                                weights=self._weights,
+                            )[0]
+                            for index in range(self._n_physical)
+                        ]
                     )
+                    if np.count_nonzero(self._weights) > 1:
+                        self._covariance = np.atleast_2d(
+                            np.cov(
+                                self._samples,
+                                rowvar=False,
+                                aweights=self._weights,
+                            )
+                        )
+                    else:
+                        self._covariance = np.zeros(
+                            (self._n_physical, self._n_physical), dtype=float
+                        )
             else:
                 draws_full = self._draw_samples(
                     u_map, covariance, variance_scale, transform_of
@@ -1797,6 +1971,29 @@ class LaplaceOptimizer(Optimizer):
 
             comm = MPI.COMM_WORLD
 
+            # The first call to the likelihood map is a collective, so every
+            # rank would compile it at the same instant. Compiling one copy of
+            # the model graph is minutes, and 128 simultaneous copies is what
+            # stalled a run for an hour on the cluster. With a persistent cache
+            # rank 0 fills it and the ranks wait for it, so the collective below
+            # is a cache read for all but one of them.
+            if jax.config.jax_compilation_cache_dir:
+                if rank == 0:
+                    warm_started = time.perf_counter()
+                    jax.block_until_ready(
+                        batched_likelihood(
+                            jnp.zeros((chunk, dimension), dtype=dtype)
+                        )
+                    )
+                    self.info(
+                        "SMC: compiled the likelihood map once on rank 0 in "
+                        "%.0f s; the other %d rank(s) read it from %s",
+                        time.perf_counter() - warm_started,
+                        size - 1,
+                        jax.config.jax_compilation_cache_dir,
+                    )
+                comm.Barrier()
+
             def likelihood_of(
                 positions: npt.NDArray[np.float64],
             ) -> npt.NDArray[np.float64]:
@@ -1893,6 +2090,28 @@ class LaplaceOptimizer(Optimizer):
                 )
                 covariance_np = candidate
                 usable_covariance = True
+        if self.pilot_samples > 0 and not mpi:
+            if usable_covariance:
+                pilot_covariance, pilot_info = self._pilot_covariance(
+                    lambda u: -(log_prior_fn(u) + log_likelihood_fn(u)),
+                    u_map,
+                    covariance_np,
+                )
+                if pilot_covariance is not None:
+                    covariance_np = pilot_covariance
+                    self._u_covariance = covariance_np
+                    self._pilot_parameters = pilot_info
+            else:
+                self.info(
+                    "SMC: pilot skipped because the Laplace covariance is "
+                    "not usable"
+                )
+        elif self.pilot_samples > 0:
+            self.info(
+                "SMC: pilot skipped in the sharded layout; SMC_MPI=0 runs it "
+                "on one process"
+            )
+
         if usable_covariance:
             factor = np.linalg.cholesky(covariance_np)
             log_det = float(np.sum(np.log(np.diag(factor))))
@@ -1944,6 +2163,7 @@ class LaplaceOptimizer(Optimizer):
         beta0 = 0.0
         polish = False
         proposal_ess = float(particles_count)
+        k_hat = float("nan")
         log_weights = np.zeros(particles_count, dtype=float)
         log_evidence = 0.0
         log_evidence_variance = 0.0
@@ -2008,15 +2228,17 @@ class LaplaceOptimizer(Optimizer):
             # tempering or gradient is needed.
             log_full = log_prior + log_like - log_proposal
             proposal_ess = log_ess(log_full)
+            k_hat = _pareto_khat(log_full)
             target_count = self.smc_target_ess * particles_count
             self.info(
                 "SMC: mixture proposal ESS %.0f/%d at beta=1 (%.0f needed to "
-                "skip the gradient stages)",
+                "skip the gradient stages), weight tail index k-hat %.2f",
                 proposal_ess,
                 particles_count,
                 target_count,
+                k_hat,
             )
-            if proposal_ess >= target_count:
+            if proposal_ess >= target_count and k_hat <= _SMC_MAX_KHAT:
                 log_evidence = float(
                     scipy_special.logsumexp(log_full) - np.log(particles_count)
                 )
@@ -2029,6 +2251,7 @@ class LaplaceOptimizer(Optimizer):
                     "start": "laplace",
                     "beta0": 1.0,
                     "proposal_ess": proposal_ess,
+                    "k_hat": k_hat,
                     "stages": 0,
                     "gradient_evaluations": 0,
                     "batch_size": batch,
@@ -2049,6 +2272,20 @@ class LaplaceOptimizer(Optimizer):
                 )
                 theta = transform_of(jnp.asarray(positions, dtype=dtype))
                 return np.asarray(theta[:, : self._n_physical]).copy(), weights
+            if proposal_ess >= target_count and k_hat > _SMC_MAX_KHAT:
+                # The weights are numerous enough but their tail decides the
+                # answer. Tempering costs gradients and does not depend on the
+                # tail, so it is the honest choice here.
+                self.warning(
+                    "SMC: the proposal weights keep ESS %.0f/%d but their "
+                    "tail index is k-hat %.2f, above the trust limit %.2f; "
+                    "their evidence and quantiles would be set by a few "
+                    "particles, so the run tempers instead",
+                    proposal_ess,
+                    particles_count,
+                    k_hat,
+                    _SMC_MAX_KHAT,
+                )
             polish = proposal_ess >= self.smc_polish_ess * particles_count
             if polish:
                 # The weights are not good enough to use as they are, but they
@@ -2125,13 +2362,15 @@ class LaplaceOptimizer(Optimizer):
             # That is one likelihood sweep against the many stages a ladder from
             # zero would otherwise spend crawling upwards.
             grid = np.linspace(0.0, 1.0, 21)[:-1]
-            ess_grid = np.array(
-                [log_ess(np.nan_to_num(beta * prior_like)) for beta in grid]
-            )
+            with np.errstate(invalid="ignore", over="ignore"):
+                ess_grid = np.array(
+                    [log_ess(np.nan_to_num(beta * prior_like)) for beta in grid]
+                )
             usable = max(2.0, 0.25 * self.smc_target_ess * particles_count)
             qualifying = grid[ess_grid >= usable]
             beta0 = float(qualifying.max()) if qualifying.size else 0.0
-            log_weights = np.nan_to_num(beta0 * prior_like)
+            with np.errstate(invalid="ignore", over="ignore"):
+                log_weights = np.nan_to_num(beta0 * prior_like)
             log_evidence = float(
                 scipy_special.logsumexp(log_weights) - np.log(particles_count)
             )
@@ -2177,6 +2416,7 @@ class LaplaceOptimizer(Optimizer):
                 particles_count=particles_count,
                 start=start,
                 proposal_ess=proposal_ess,
+                k_hat=k_hat,
             )
 
         # The HMC metric is the Laplace covariance, so the posterior is about
@@ -2387,6 +2627,17 @@ class LaplaceOptimizer(Optimizer):
                 time.perf_counter() - started,
             )
 
+        if ess_value < 0.1 * particles_count:
+            self.warning(
+                "SMC: the final effective sample size is %.0f of %d particles, "
+                "so the weighted quantiles and error bars carry the "
+                "information of about %.0f independent draws; raise "
+                "num_particles or smc_target_ess",
+                ess_value,
+                particles_count,
+                ess_value,
+            )
+
         if beta < 1.0:
             self.warning(
                 "SMC stopped after %d stages with the tempering parameter at "
@@ -2402,16 +2653,19 @@ class LaplaceOptimizer(Optimizer):
         self._log_evidence_error = float(np.sqrt(log_evidence_variance))
         weights = np.asarray(state.weights, dtype=float)
         weights = weights / weights.sum()
+        # One trajectory per particle per stage: the gradient that initialises
+        # it plus the leapfrogs, times the transitions the kernel applies.
         gradient_evaluations = (
             stage
             * self.num_mcmc_steps
             * particles_count
-            * self.smc_hmc_steps
+            * (self.smc_hmc_steps + 1)
         )
         self._smc_parameters = {
             "start": start,
             "beta0": beta0,
             "proposal_ess": proposal_ess,
+            "k_hat": k_hat,
             "stages": stage,
             "gradient_evaluations": gradient_evaluations,
             "batch_size": batch,
@@ -2458,6 +2712,7 @@ class LaplaceOptimizer(Optimizer):
         particles_count: int,
         start: str,
         proposal_ess: float,
+        k_hat: float,
     ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         """Run the SMC stages with the particle axis split over MPI ranks.
 
@@ -2823,6 +3078,17 @@ class LaplaceOptimizer(Optimizer):
                     size,
                 )
 
+        if ess_value < 0.1 * particles_count and rank == 0:
+            self.warning(
+                "SMC: the final effective sample size is %.0f of %d particles, "
+                "so the weighted quantiles and error bars carry the "
+                "information of about %.0f independent draws; raise "
+                "num_particles or smc_target_ess",
+                ess_value,
+                particles_count,
+                ess_value,
+            )
+
         if beta < 1.0 and rank == 0:
             self.warning(
                 "SMC stopped after %d stages with the tempering parameter at "
@@ -2837,16 +3103,19 @@ class LaplaceOptimizer(Optimizer):
         self._log_evidence = log_z
         self._log_evidence_error = float(np.sqrt(log_z_variance))
         weights = weights / weights.sum()
+        # One trajectory per particle per stage: the gradient that initialises
+        # it plus the leapfrogs, times the transitions the kernel applies.
         gradient_evaluations = (
             stage
             * self.num_mcmc_steps
             * particles_count
-            * self.smc_hmc_steps
+            * (self.smc_hmc_steps + 1)
         )
         self._smc_parameters = {
             "start": start,
             "beta0": beta0,
             "proposal_ess": proposal_ess,
+            "k_hat": k_hat,
             "stages": stage,
             "gradient_evaluations": gradient_evaluations,
             "batch_size": chunk,
@@ -2874,6 +3143,164 @@ class LaplaceOptimizer(Optimizer):
                 100.0 * ess_value / particles_count,
             )
         return samples, weights
+
+    def _pilot_covariance(
+        self,
+        objective: t.Callable[[Array], Array],
+        u_map: Array,
+        covariance_u: npt.NDArray[np.float64],
+    ) -> t.Tuple[t.Optional[npt.NDArray[np.float64]], t.Dict[str, t.Any]]:
+        """Correct a local Laplace covariance with a short NUTS pilot.
+
+        The Laplace Hessian describes the posterior at one point, in a
+        Gaussian approximation. Opacity interpolation, chemistry edges and
+        cloud-deck boundaries make the actual posterior bend away from it, and
+        a warm-up that starts from a wrong metric spends gradients learning
+        the geometry. This runs ``pilot_warmup`` adaptation steps and
+        ``pilot_samples`` NUTS draws in the Laplace-whitened coordinates,
+        takes the sample covariance, and blends it with the Laplace
+        covariance.
+
+        The blend is a shrinkage, not a replacement. A sample covariance from
+        N draws in d dimensions is noisy and rank deficient when d >= N; the
+        Laplace term keeps the metric positive definite and sets the scale of
+        the directions the pilot did not visit. In the whitened space the
+        blend is ``(1 - lambda) * C_pilot + lambda * I``, with lambda the
+        Laplace weight; in ``u`` space it is that matrix pushed through the
+        Cholesky factor of the Laplace covariance.
+
+        Parameters
+        ----------
+        objective:
+            Negative log posterior of one unconstrained vector, including the
+            transform Jacobian
+
+        u_map:
+            Location of the mode, the centre of the whitening
+
+        covariance_u:
+            Laplace covariance in unconstrained space
+
+        Returns
+        -------
+        covariance, info:
+            The blended covariance, and the pilot diagnostics. ``None`` and an
+            empty dict when the pilot is unusable, in which case the caller
+            keeps the Laplace covariance.
+        """
+        import blackjax
+
+        dimension = int(np.asarray(u_map).shape[0])
+        covariance_np = np.asarray(covariance_u, dtype=float)
+        covariance_np = 0.5 * (covariance_np + covariance_np.T)
+        if covariance_np.shape != (dimension, dimension):
+            raise ValueError(
+                f"pilot covariance must be {dimension}x{dimension}, not "
+                f"{covariance_np.shape}"
+            )
+        if not self._is_usable_covariance(covariance_np):
+            return None, {}
+
+        factor = np.linalg.cholesky(covariance_np)
+        factor_j = jnp.asarray(factor, dtype=jnp.float64)
+        u_map_j = jnp.asarray(u_map, dtype=jnp.float64)
+
+        def logdensity_v(v: Array) -> Array:
+            return -objective(u_map_j + factor_j @ v)
+
+        doublings = min(self.max_num_doublings, 6)
+        key = jax.random.PRNGKey(
+            0 if self.seed is None else int(self.seed) + 1
+        )
+        key, warmup_key, sample_key = jax.random.split(key, 3)
+        self.info(
+            "Pilot: %d NUTS draws after %d warm-up steps from the mode, at "
+            "most %d leapfrog doublings",
+            self.pilot_samples,
+            self.pilot_warmup,
+            doublings,
+        )
+        warmup = blackjax.window_adaptation(
+            blackjax.nuts,
+            logdensity_v,
+            is_mass_matrix_diagonal=True,
+            max_num_doublings=doublings,
+        )
+        (state, parameters), _ = warmup.run(
+            warmup_key,
+            jnp.zeros(dimension, dtype=jnp.float64),
+            num_steps=self.pilot_warmup,
+        )
+        algorithm = blackjax.nuts(
+            logdensity_v,
+            **{
+                name: value
+                for name, value in parameters.items()
+                if name != "max_num_doublings"
+            },
+            max_num_doublings=doublings,
+        )
+
+        def one_step(carry: t.Any, step_key: Array) -> t.Tuple[t.Any, Array]:
+            carry, _ = algorithm.step(step_key, carry)
+            return carry, carry.position
+
+        keys = jax.random.split(sample_key, self.pilot_samples)
+        _, positions_v = jax.lax.scan(one_step, state, keys)
+        positions_v = np.asarray(jax.block_until_ready(positions_v))
+        if not np.all(np.isfinite(positions_v)):
+            self.warning(
+                "Pilot: %d of %d draws are not finite; keeping the Laplace "
+                "covariance",
+                int(np.count_nonzero(~np.isfinite(positions_v))),
+                positions_v.size,
+            )
+            return None, {}
+        pilot_cov_v = np.atleast_2d(np.cov(positions_v, rowvar=False))
+        pilot_cov_v = 0.5 * (pilot_cov_v + pilot_cov_v.T)
+        if not np.all(np.isfinite(pilot_cov_v)) or np.trace(pilot_cov_v) <= 0.0:
+            self.warning(
+                "Pilot: the draws have no usable spread; keeping the Laplace "
+                "covariance"
+            )
+            return None, {}
+
+        if self.pilot_blend is not None:
+            blend = float(self.pilot_blend)
+        else:
+            blend = float(
+                np.clip(
+                    dimension / (dimension + self.pilot_samples),
+                    0.1,
+                    0.9,
+                )
+            )
+        blended_v = (1.0 - blend) * pilot_cov_v + blend * np.eye(dimension)
+        blended_u = factor @ blended_v @ factor.T
+        blended_u = 0.5 * (blended_u + blended_u.T)
+        if not self._is_usable_covariance(blended_u):
+            self.warning(
+                "Pilot: the blended covariance is not positive definite; "
+                "keeping the Laplace covariance"
+            )
+            return None, {}
+        trace = float(np.trace(covariance_np))
+        info = {
+            "warmup": self.pilot_warmup,
+            "samples": self.pilot_samples,
+            "blend": blend,
+            "trace_ratio": (
+                float(np.trace(blended_u) / trace) if trace > 0.0 else float("nan")
+            ),
+        }
+        self.info(
+            "Pilot: blended the %d-draw covariance with the Laplace one, "
+            "Laplace weight %.2f, trace ratio %.2f",
+            self.pilot_samples,
+            blend,
+            info["trace_ratio"],
+        )
+        return blended_u, info
 
     def _run_nuts(
         self,
@@ -3138,8 +3565,13 @@ class LaplaceOptimizer(Optimizer):
 
         Returns
         -------
-        :obj:`numpy.ndarray`
-            Posterior draws in parameter space, shape ``(nsamples, nparams)``
+        samples, weights:
+            The proposals in parameter space, shape ``(num_samples, nparams)``,
+            and their normalised importance weights. The proposals are not
+            resampled: resampling with replacement would turn ``effective``
+            independent draws into ``num_samples`` equally weighted ones and
+            make every reported error too small by ``sqrt(num_samples /
+            effective)``.
 
         """
         dimension = u_map.shape[0]
@@ -3191,14 +3623,17 @@ class LaplaceOptimizer(Optimizer):
 
         weights = np.exp(log_weights - log_weights.max())
         total = float(weights.sum())
-        effective = total**2 / float(np.sum(weights**2))
+        weights = weights / total
+        effective = 1.0 / float(np.sum(weights**2))
+        k_hat = _pareto_khat(log_weights)
         self.info(
             "Importance sampling: %d proposals, effective sample size %.0f "
-            "(%.1f%% of them), largest weight %.3f",
+            "(%.1f%% of them), largest weight %.3f, tail index k-hat %.2f",
             num,
             effective,
             100.0 * effective / num,
-            float(weights.max()) / total,
+            float(weights.max()),
+            k_hat,
         )
         if effective < 0.1 * num:
             self.warning(
@@ -3212,16 +3647,27 @@ class LaplaceOptimizer(Optimizer):
                 num,
                 effective,
             )
+        if k_hat > _SMC_MAX_KHAT:
+            self.warning(
+                "Importance sampling: the weight tail index is k-hat %.2f, "
+                "above the trust limit %.2f, so the largest weights decide "
+                "these draws and their errors. Raise num_samples, or use "
+                "sampler='smc', which tempers the proposal instead of "
+                "trusting it",
+                k_hat,
+                _SMC_MAX_KHAT,
+            )
 
-        # Resampling with replacement turns the weighted proposals into the
-        # equal-weight draws the rest of the pipeline expects; the duplication
-        # it introduces is the loss of information the effective sample size
-        # already reports.
-        generator = np.random.default_rng(0 if self.seed is None else int(self.seed))
-        picks = generator.choice(num, size=num, replace=True, p=weights / total)
-        positions = u_map[None, :] + jnp.asarray(np.asarray(whitened)[picks]) @ factor.T
+        # The proposals are returned with their weights instead of being
+        # resampled: a resample with replacement would make the quantiles and
+        # the covariance below treat `effective` independent draws as
+        # `num_samples` independent ones, which understates every error bar.
+        positions = u_map[None, :] + whitened @ factor.T
         theta = transform_of(positions)
-        return np.asarray(theta[:, : self._n_physical]).copy()
+        return (
+            np.asarray(theta[:, : self._n_physical]).copy(),
+            weights,
+        )
 
     def _run_mclmc(
         self,
@@ -3636,6 +4082,11 @@ class LaplaceOptimizer(Optimizer):
     def smc_parameters(self) -> t.Optional[t.Dict[str, t.Any]]:
         """How the SMC run spent its budget: start, beta0, stages, gradients."""
         return self._smc_parameters
+
+    @property
+    def pilot_parameters(self) -> t.Optional[t.Dict[str, t.Any]]:
+        """How the pilot covariance was built, or None when it was off."""
+        return self._pilot_parameters
 
     @property
     def fisher(self) -> t.Optional[npt.NDArray[np.float64]]:
@@ -4056,7 +4507,11 @@ class LaplaceOptimizer(Optimizer):
         return summary
 
     def get_samples(self, solution_id: int) -> npt.NDArray[np.float64]:
-        """Posterior samples drawn from the Laplace approximation.
+        """Posterior draws of the fitted solution.
+
+        The Laplace, NUTS and MCLMC paths return equally weighted draws; SMC
+        and importance sampling return weighted particles, whose weights are
+        available from :meth:`get_weights`.
 
         Parameters
         ----------

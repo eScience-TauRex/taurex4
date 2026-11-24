@@ -1,0 +1,165 @@
+[Global]
+# xsec_path and multi_nest_path are written by submit.sh from its arguments
+# (xsec_path from <resolution-k>, multi_nest_path from the whole run tag).
+# The values below are the R50k defaults, kept so this file also runs as is.
+xsec_path = ../Inputs/xsec_exomol_R50k
+cia_path = ../Inputs/cia
+mpi_use_shared = True
+
+[Chemistry]
+chemistry_type = taurex
+
+    [[H2O]]
+    gas_type = constant
+    mix_ratio = 1e-5
+    
+    [[CO]]
+    gas_type = constant
+    mix_ratio = 1e-5
+
+    [[CO2]]
+    gas_type = constant
+    mix_ratio = 1e-5
+
+    [[CH4]]
+    gas_type = constant
+    mix_ratio = 1e-5
+
+[Temperature]
+profile_type = isothermal
+T = 1000.
+
+[Pressure]
+profile_type = simple
+atm_min_pressure = 1e-2
+atm_max_pressure = 1e6
+nlayers = 80
+
+[Planet]
+planet_type = simple
+planet_mass = 0.12
+planet_radius = 0.82
+
+[Star]
+star_type = blackbody
+radius = 0.676
+temperature = 6400.
+
+[Model]
+model_type = transmission
+#parfiles = m1.par, m2.par
+#fractions = 0.5, 0.5
+
+    [[Absorption]]
+	
+    [[Rayleigh]]
+	
+    [[CIA]]
+    cia_pairs= H2-H2, H2-He
+    
+    #[[PyLeeMieMultiple]]
+    #lee_mie_radius = 0.01,
+    #lee_mie_q = 40,
+    #lee_mie_mix_ratio = 1e1,
+    #lee_mie_midP = 1e1,
+    #lee_mie_rangeP = 1,
+    
+    [[LeeMie]]
+    lee_mie_radius = 0.01
+    lee_mie_q = 40
+    lee_mie_mix_ratio = 1e1
+    lee_mie_bottomP = 1e6
+    lee_mie_topP = 1e3
+
+    [[FlatMie]]
+    flat_mix_ratio = 10
+    flat_bottomP = 1e6
+    flat_topP = 1e3
+    
+[Observation]
+observation = observed
+filename = ../Inputs/Spectra/WFC3_FULL_Fiducial_Pegasus_Spectrum.txt
+
+[Optimizer]
+optimizer = multinest
+num_live_points = 302
+evidence_tolerance = 0.5
+resume=True
+verbose_output= True
+search_multi_modes = False
+multi_nest_path = multi_50k
+n_iter_before_update=20
+sigma_fraction = 0.2
+max_iterations=0
+
+[Fitting]
+
+#fr_1:fit = True
+#fr_1:bounds = 0, 1
+
+planet_radius:fit = True
+planet_radius:bounds = 0.5, 1.5
+
+T:fit = True
+T:bounds = 200, 3000
+
+H2O:fit = True
+H2O:bounds = 1e-12, 1e-1
+
+CO:fit = True
+CO:bounds = 1e-12, 1e-1
+
+CO2:fit = True
+CO2:bounds = 1e-12, 1e-1
+
+CH4:fit = True
+CH4:bounds = 1e-12, 1e-1
+
+flat_topP:fit = True
+flat_topP:bounds = 1e6, 1e-1
+flat_topP:mode = log
+
+lee_mie_radius:fit = True
+lee_mie_radius:bounds = 1e-4, 100
+lee_mie_radius:mode = log
+
+lee_mie_mix_ratio:fit = True
+lee_mie_mix_ratio:bounds = 1e-30, 1e-2
+lee_mie_mix_ratio:mode = log
+
+lee_mie_q:fit = True
+lee_mie_q:bounds = 1, 99
+lee_mie_q:mode = linear
+
+lee_mie_topP:fit = True
+lee_mie_topP:bounds = 1e6, 1e-3
+lee_mie_topP:mode = log
+
+lee_mie_bottomP:fit = False
+lee_mie_bottomP:bounds = 1e6, 1e-3
+lee_mie_bottomP:mode = linear
+
+
+#lee_mie_radius_1:fit = True
+#lee_mie_radius_1:bounds = 1e-4, 100
+#lee_mie_radius_1:mode = log
+
+#lee_mie_mix_ratio_1:fit = True
+#lee_mie_mix_ratio_1:bounds = 1, 1e16
+#lee_mie_mix_ratio_1:mode = log
+
+#lee_mie_q_1:fit = True
+#lee_mie_q_1:bounds = 1, 99
+#lee_mie_q_1:mode = linear
+
+#lee_mie_midP_1:fit = True
+#lee_mie_midP_1:bounds = 1e6, 1e-3
+#lee_mie_midP_1:mode = log
+
+#lee_mie_rangeP_1:fit = True
+#lee_mie_rangeP_1:bounds = 0.2, 4
+#lee_mie_rangeP_1:mode = linear
+
+
+
+

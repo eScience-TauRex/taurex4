@@ -27,6 +27,16 @@ from taurex.types import AnyValType
 
 SQRTPI = np.sqrt(2 * np.pi)
 
+AUTO_LOG_DECADES = 2.0
+"""Width in decades above which ``mode = auto`` chooses a log prior.
+
+A uniform prior over more than two decades puts almost all of its mass where
+``d theta / d u`` is tiny under the sigmoid-to-prior transform, so the mode
+search, the Hessian and the HMC metric are all badly conditioned. ``auto``
+chooses ``LogUniform`` there and ``Uniform`` otherwise; an explicit ``linear``
+or ``log`` still wins.
+"""
+
 
 class FitParamOutput(t.TypedDict):
     """Dictionary for storing fit parameter output."""
@@ -48,7 +58,7 @@ class FitParam:
     latex: str
     fget: t.Callable[[], float]
     fset: t.Callable[[float], None]
-    mode: t.Literal["linear", "log"]
+    mode: t.Literal["linear", "log", "auto"]
     to_fit: bool
     bounds: t.Tuple[float, float]
     prior: Prior = None
@@ -58,6 +68,11 @@ class FitParam:
         """Get prior for fitting."""
         if self.prior is not None:
             return self.prior
+        if self.mode == "auto":
+            low, high = min(self.bounds), max(self.bounds)
+            if low > 0.0 and high / low > 10.0**AUTO_LOG_DECADES:
+                return LogUniform(lin_bounds=self.bounds)
+            return Uniform(bounds=self.bounds)
         if self.mode == "linear":
             return Uniform(bounds=self.bounds)
         return LogUniform(lin_bounds=self.bounds)
@@ -545,7 +560,7 @@ class Optimizer(Logger, Citable):
     def set_mode(
         self,
         parameter: str,
-        new_mode: t.Literal["linear", "log"],
+        new_mode: t.Literal["linear", "log", "auto"],
     ) -> None:
         """Sets the fitting mode of a parameter.
 
@@ -553,8 +568,9 @@ class Optimizer(Logger, Citable):
         ----------
         parameter : str
             Parameter name to set mode for.
-        new_mode : t.Literal["linear", "log"]
-            New fitting mode.
+        new_mode : t.Literal["linear", "log", "auto"]
+            New fitting mode. ``auto`` picks a log prior when the bounds span
+            more than :data:`AUTO_LOG_DECADES` decades and are both positive.
 
         """
         self.avail_fit_parameters[parameter].mode = new_mode

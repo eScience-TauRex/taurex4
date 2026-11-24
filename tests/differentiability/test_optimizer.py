@@ -707,7 +707,7 @@ def test_smc_polishes_a_moderate_proposal_without_tempering(
     assert parameters["stages"] == 1
     assert parameters["start"] == "laplace"
     assert parameters["gradient_evaluations"] == (
-        optimizer.num_particles * optimizer.smc_hmc_steps
+        optimizer.num_particles * (optimizer.smc_hmc_steps + 1)
     )
     assert np.isfinite(optimizer.log_evidence)
     samples = optimizer.get_samples(0)
@@ -801,26 +801,33 @@ def test_smc_without_a_mode_fit_tempers_from_the_prior(taurex_model, observation
     assert abs(float(optimizer._median[0]) - truth[0]) < 0.02
 
 
-def test_non_finite_log_likelihood_raises_instead_of_tempering():
-    """A nan or infinite log likelihood is reported, not carried into beta.
+def test_non_finite_log_likelihood_is_zero_weight_or_refused():
+    """A bad draw carries zero weight; a broken sample refuses to run.
 
-    One such particle drives the ESS of every stage to nan, which leaves the
-    tempering parameter where it is and turns the evidence into nan; the run
-    has to stop and name the parameters instead.
+    One non-finite particle drives the ESS of every stage to nan, which leaves
+    the tempering parameter where it is and turns the evidence into nan, so it
+    is reported and given ``-inf`` weight. A sample where nothing is finite has
+    no ESS to temper with and stops the run instead.
     """
-    from taurex.differentiability.optimizer import _check_finite_log_likelihood
+    from taurex.differentiability.optimizer import _sanitise_log_likelihood
 
     positions = np.zeros((4, 2))
     log_like = np.array([-3.0, np.nan, -np.inf, 2.0])
-    with pytest.raises(ValueError, match="not finite for 2 of 4 particles"):
-        _check_finite_log_likelihood(log_like, positions, lambda u: u, "stage 1")
+    cleaned = _sanitise_log_likelihood(
+        log_like, positions, lambda u: u, "stage 1"
+    )
+    assert np.array_equal(np.isfinite(cleaned), np.array([True, False, False, True]))
+    assert cleaned[0] == -3.0 and cleaned[3] == 2.0
 
-    # A finite batch passes and returns nothing.
-    assert (
-        _check_finite_log_likelihood(
-            np.array([-3.0, 2.0]), np.zeros((2, 2)), lambda u: u, "stage 1"
-        )
-        is None
+    broken = np.array([np.nan, np.inf, -np.inf, np.nan])
+    with pytest.raises(ValueError, match="not finite for 4 of 4 particles"):
+        _sanitise_log_likelihood(broken, positions, lambda u: u, "stage 1")
+
+    # A finite batch comes back untouched.
+    finite = np.array([-3.0, 2.0])
+    assert np.array_equal(
+        _sanitise_log_likelihood(finite, np.zeros((2, 2)), lambda u: u, "stage 1"),
+        finite,
     )
 
 
@@ -860,4 +867,159 @@ def test_smc_draws_weighted_quantiles_and_bands(taurex_model, observation):
     assert solution["GlobalStats"]["global evidence"] == pytest.approx(
         optimizer.log_evidence
     )
+
+
+def test_importance_returns_weighted_draws(taurex_model, observation):
+    """Importance sampling keeps its weights instead of resampling them.
+
+    Resampling the proposals with replacement would report ``num_samples``
+    independent draws when only the effective sample size are, which makes
+    every error bar too small; the weights are carried to the output instead.
+    """
+    optimizer = LaplaceOptimizer(
+        num_samples=400,
+        max_iterations=100,
+        sampler="importance",
+        seed=37,
+    )
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    optimizer.enable_fit("planet_radius")
+
+    truth = np.array([1.07])
+    optimizer.update_model(truth)
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    clean = np.asarray(atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64)))
+    generator = np.random.default_rng(12)
+    observation._obs_spectrum[:, 1] = clean + generator.normal(
+        0.0, 1e-4, clean.shape
+    )
+    optimizer.update_model(truth)
+    optimizer.compute_fit()
+
+    samples = optimizer.get_samples(0)
+    weights = optimizer.get_weights(0)
+    assert samples.shape == (optimizer.num_samples, 1)
+    assert weights.shape == (optimizer.num_samples,)
+    assert float(weights.sum()) == pytest.approx(1.0)
+    assert np.all(weights >= 0.0)
+    # The draw is not an equal-weight Laplace sample: the weights vary across
+    # proposals, and this posterior (nearly Gaussian in u) keeps most of them.
+    assert float(weights.max()) > 1.0 / optimizer.num_samples
+    effective = 1.0 / float(np.sum(weights**2))
+    assert effective > 0.5 * optimizer.num_samples
+    assert abs(float(optimizer._median[0]) - truth[0]) < 0.02
+    assert optimizer._covariance.shape == (1, 1)
+    assert optimizer._covariance[0, 0] > 0.0
+
+
+def test_weight_tail_index_separates_light_and_heavy_proposals():
+    """The PSIS tail index refuses a proposal whose largest weights decide it."""
+    from taurex.differentiability.optimizer import _pareto_khat
+
+    generator = np.random.default_rng(3)
+    light = np.log(generator.pareto(3.0, 1000) + 1e-12)
+    heavy = np.log(generator.pareto(0.7, 1000) + 1e-12)
+    assert _pareto_khat(np.zeros(1000)) == 0.0
+    assert _pareto_khat(light) < 0.5
+    assert _pareto_khat(heavy) > 0.7
+    assert not np.isfinite(_pareto_khat(np.zeros(4)))
+
+
+def test_auto_log_mode_uses_a_log_prior_for_wide_bounds():
+    """``mode = auto`` chooses a log prior only when the bounds span decades."""
+    from taurex.core.priors import LogUniform
+    from taurex.core.priors import Uniform
+    from taurex.optimizer.optimizer import FitParam
+
+    wide = FitParam(
+        "x", "x", lambda: 1e-5, lambda value: None, "auto", True, (1e-12, 1e-1)
+    )
+    narrow = FitParam(
+        "y", "y", lambda: 1.0, lambda value: None, "auto", True, (0.5, 1.5)
+    )
+    assert isinstance(wide.fit_prior, LogUniform)
+    assert isinstance(narrow.fit_prior, Uniform)
+    assert wide.fit_name == "log_x"
+
+
+def test_nuts_pilot_blends_the_laplace_covariance(taurex_model, observation):
+    """A short pilot replaces the local Laplace metric with a blended one."""
+    optimizer = LaplaceOptimizer(
+        num_samples=80,
+        max_iterations=100,
+        sampler="nuts",
+        num_warmup=40,
+        num_chains=1,
+        max_num_doublings=4,
+        pilot_warmup=40,
+        pilot_samples=20,
+        seed=41,
+    )
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    optimizer.enable_fit("planet_radius")
+
+    truth = np.array([1.07])
+    optimizer.update_model(truth)
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    clean = np.asarray(atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64)))
+    generator = np.random.default_rng(11)
+    observation._obs_spectrum[:, 1] = clean + generator.normal(
+        0.0, 1e-4, clean.shape
+    )
+    optimizer.update_model(truth)
+    optimizer.compute_fit()
+
+    pilot = optimizer.pilot_parameters
+    assert pilot is not None
+    assert 0.0 <= pilot["blend"] <= 1.0
+    assert np.isfinite(pilot["trace_ratio"])
+    assert np.all(np.isfinite(optimizer.get_samples(0)))
+    assert abs(float(optimizer._median[0]) - truth[0]) < 0.02
+
+
+def test_smc_pilot_blends_the_covariance(taurex_model, observation):
+    """The pilot also seeds the prior-start SMC proposal and metric."""
+    optimizer = LaplaceOptimizer(
+        num_samples=64,
+        sampler="smc",
+        smc_fit="none",
+        smc_start="prior",
+        num_particles=32,
+        num_mcmc_steps=1,
+        smc_hmc_steps=2,
+        smc_max_delta=0.5,
+        max_num_doublings=4,
+        pilot_warmup=40,
+        pilot_samples=20,
+        seed=43,
+    )
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    optimizer.enable_fit("planet_radius")
+
+    truth = np.array([1.07])
+    optimizer.update_model(truth)
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    clean = np.asarray(atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64)))
+    generator = np.random.default_rng(12)
+    observation._obs_spectrum[:, 1] = clean + generator.normal(
+        0.0, 1e-4, clean.shape
+    )
+    optimizer.update_model(truth)
+    optimizer.compute_fit()
+
+    pilot = optimizer.pilot_parameters
+    assert pilot is not None
+    assert 0.0 <= pilot["blend"] <= 1.0
+    assert np.isfinite(optimizer.log_evidence)
+    assert np.all(np.isfinite(optimizer.get_samples(0)))
+    assert abs(float(optimizer._median[0]) - truth[0]) < 0.02
 
