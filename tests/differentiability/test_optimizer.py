@@ -550,10 +550,87 @@ def test_laplace_covariance_clips_an_unconstrained_direction():
     assert np.min(np.linalg.eigvalsh(covariance)) > 0.0
 
 
+def test_prior_dominated_coordinate_gets_the_prior_scale():
+    """A direction the data leaves flat is whitened with the prior variance.
+
+    The data curvature is the full Hessian minus its prior-and-Jacobian part.
+    A coordinate whose data error bar is several prior standard deviations
+    wide has the prior as its posterior, so its whitening has to be the prior's
+    ``pi^2/3`` rather than a clipped-Hessian value that can be orders of
+    magnitude narrower and stretch every HMC trajectory.
+    """
+    prior = np.diag([0.5, 0.5])
+    # The first parameter is strongly constrained by the data, the second not.
+    full = prior + np.diag([100.0, 1e-6])
+    mask = LaplaceOptimizer._prior_dominated(full, prior, 2, 3.0)
+    assert mask.tolist() == [False, True]
+
+    covariance = np.array([[1e-3, 2e-4], [2e-4, 1e-8]])
+    scaled = LaplaceOptimizer._prior_scale_covariance(covariance, mask)
+    assert scaled[0, 0] == pytest.approx(1e-3)
+    assert scaled[1, 1] == pytest.approx(np.pi**2 / 3.0)
+    assert scaled[0, 1] == pytest.approx(0.0)
+    np.testing.assert_allclose(scaled, scaled.T)
+
+
+def test_prior_dominated_detection_can_be_disabled():
+    """A zero or missing threshold leaves every coordinate alone."""
+    optimizer = LaplaceOptimizer(prior_dominated_sigma=None)
+    assert optimizer.prior_dominated_sigma is None
+    covariance = np.diag([1e-3, 1e-3])
+    adjusted = optimizer._adjust_for_prior_dominated(
+        np.diag([10.0, 1e-6]), np.diag([0.5, 0.5]), covariance
+    )
+    np.testing.assert_allclose(adjusted, covariance)
+
+
+def test_nuts_whitens_a_flat_direction_with_the_prior(taurex_model, observation):
+    """A coordinate the data barely constrains is given the prior scale.
+
+    The threshold is deliberately extreme so the strongly constrained parameter
+    is still marked prior dominated; the metric then uses the prior variance,
+    and NUTS still has to return finite draws from the posterior because the
+    target itself did not change.
+    """
+    optimizer = LaplaceOptimizer(
+        num_samples=100,
+        max_iterations=100,
+        sampler="nuts",
+        num_warmup=60,
+        num_chains=2,
+        prior_dominated_sigma=0.01,
+    )
+    optimizer.set_model(taurex_model)
+    optimizer.set_observed(observation)
+    optimizer.enable_fit("planet_radius")
+
+    truth = np.array([1.07])
+    optimizer.update_model(truth)
+    atmosphere = Atmosphere(
+        taurex_model, observation, fit_params=optimizer.fitting_parameters
+    )
+    clean = np.asarray(atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64)))
+    generator = np.random.default_rng(3)
+    observation._obs_spectrum[:, 1] = clean + generator.normal(0.0, 1e-4, clean.shape)
+    optimizer.update_model(truth)
+    optimizer.compute_fit()
+
+    samples = optimizer.get_samples(0)
+    assert samples.shape == (100, 1)
+    assert np.all(np.isfinite(samples))
+    assert optimizer._u_covariance is not None
+
+
 def test_unknown_sampler_is_rejected():
-    """A misspelt sampler is an error rather than a silent Laplace fit."""
-    with pytest.raises(ValueError, match="Unknown sampler"):
-        LaplaceOptimizer(sampler="hmc")
+    """A misspelt sampler is an error rather than a silent Laplace fit.
+
+    ``jax`` names the optimizer, not a sampler: the Gaussian is ``laplace``.
+    The removed ``importance`` and ``mclmc`` samplers are rejected too, so an
+    input file they were written for cannot run something else by accident.
+    """
+    for name in ("hmc", "jax", "importance", "mclmc"):
+        with pytest.raises(ValueError, match="Unknown sampler"):
+            LaplaceOptimizer(sampler=name)
 
 
 def test_smc_sampler_is_read_from_the_input_file():
@@ -910,52 +987,6 @@ def test_smc_draws_weighted_quantiles_and_bands(taurex_model, observation):
     assert solution["GlobalStats"]["global evidence"] == pytest.approx(
         optimizer.log_evidence
     )
-
-
-def test_importance_returns_weighted_draws(taurex_model, observation):
-    """Importance sampling keeps its weights instead of resampling them.
-
-    Resampling the proposals with replacement would report ``num_samples``
-    independent draws when only the effective sample size are, which makes
-    every error bar too small; the weights are carried to the output instead.
-    """
-    optimizer = LaplaceOptimizer(
-        num_samples=400,
-        max_iterations=100,
-        sampler="importance",
-        seed=37,
-    )
-    optimizer.set_model(taurex_model)
-    optimizer.set_observed(observation)
-    optimizer.enable_fit("planet_radius")
-
-    truth = np.array([1.07])
-    optimizer.update_model(truth)
-    atmosphere = Atmosphere(
-        taurex_model, observation, fit_params=optimizer.fitting_parameters
-    )
-    clean = np.asarray(atmosphere.spectrum(jnp.asarray(truth, dtype=jnp.float64)))
-    generator = np.random.default_rng(12)
-    observation._obs_spectrum[:, 1] = clean + generator.normal(
-        0.0, 1e-4, clean.shape
-    )
-    optimizer.update_model(truth)
-    optimizer.compute_fit()
-
-    samples = optimizer.get_samples(0)
-    weights = optimizer.get_weights(0)
-    assert samples.shape == (optimizer.num_samples, 1)
-    assert weights.shape == (optimizer.num_samples,)
-    assert float(weights.sum()) == pytest.approx(1.0)
-    assert np.all(weights >= 0.0)
-    # The draw is not an equal-weight Laplace sample: the weights vary across
-    # proposals, and this posterior (nearly Gaussian in u) keeps most of them.
-    assert float(weights.max()) > 1.0 / optimizer.num_samples
-    effective = 1.0 / float(np.sum(weights**2))
-    assert effective > 0.5 * optimizer.num_samples
-    assert abs(float(optimizer._median[0]) - truth[0]) < 0.02
-    assert optimizer._covariance.shape == (1, 1)
-    assert optimizer._covariance[0, 0] > 0.0
 
 
 def test_weight_tail_index_separates_light_and_heavy_proposals():

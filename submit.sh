@@ -8,13 +8,14 @@
 #   ranks-per-node    MPI ranks per node, or the cores of the one jax task
 #   resolution-k      cross-section resolution in k: 1, 15, 50, 100
 #   branch            jax (taurex4, .venv_jax, default) | original (taurex3, .venv)
-#   solver            multinest [default] | jax | laplace | nuts | mclmc | smc
+#   solver            multinest [default] | laplace | nuts | smc
 #
-# solver=jax is the differentiability plugin's optimizer: it fits the mode and
-# draws with the sampler from the solver argument (laplace, nuts, mclmc, smc;
-# smc also returns log Z). It always runs as one task on one node, with XLA
-# spreading the compiled programs over <ranks-per-node> cores. multinest runs
-# taurex3 under mpirun.
+# laplace|nuts|smc select the differentiability plugin's optimizer: it fits the
+# mode and draws with that sampler (smc also returns log Z). It always runs as
+# one task on one node, with XLA spreading the compiled programs over
+# <ranks-per-node> cores. multinest runs taurex3 under mpirun. `jax` names the
+# branch, not a solver, so the sampler is always explicit; `laplace` is the
+# Gaussian one.
 #
 # The hyperparameters below are set for one final posterior on the 11-parameter
 # WFC3 fit: a short mode fit for the samplers, 1000 NUTS draws, and 512 SMC
@@ -23,17 +24,23 @@
 # of compilation.
 #
 # Environment overrides:
-#   JAX_NUM_SAMPLES=1000    nuts/mclmc draws
-#   JAX_NUM_CHAINS=16       nuts/mclmc chains
-#   JAX_NUM_WARMUP=200      nuts warm-up steps per chain
+#   JAX_NUM_SAMPLES=800     nuts draws
+#   JAX_NUM_CHAINS=16       nuts chains
+#   JAX_NUM_WARMUP=250      nuts warm-up steps per chain
+#   JAX_MAX_NUM_DOUBLINGS=9 nuts trajectory cap, at most 2**9 leapfrogs
 #   JAX_NUM_PARTICLES=512   smc particles; also its posterior resolution
 #   JAX_SMC_HMC_STEPS=8     smc leapfrogs per particle per stage
 #   JAX_SMC_BATCH_SIZE=32   smc particles per vmapped batch (memory knob)
+#   JAX_PILOT_WARMUP=100    smc: NUTS pilot warm-up before the proposal
+#   JAX_PILOT_SAMPLES=200   smc: NUTS pilot draws blended into the covariance
+#   JAX_PILOT_BLEND=0.3     smc: Laplace weight in that blend
+#   JAX_PRIOR_DOMINATED_SIGMA=3  sampler: data/prior error ratio above which a
+#                           flat direction is whitened with the prior scale
 #   JAX_CACHE_DIR=$PWD/.jax_cache   exported as JAX_COMPILATION_CACHE_DIR
 #   LIGHT=1 EXCLUSIVE=1 PARTITION=rome TIME=03:00:00 SCRIPT_DIR=/tmp/taurex_submit
 
 usage() {
-    echo "usage: $0 <nodes> <ranks-per-node> <resolution-k> [jax|original] [multinest|jax|laplace|nuts|mclmc|smc]" >&2
+    echo "usage: $0 <nodes> <ranks-per-node> <resolution-k> [jax|original] [multinest|laplace|nuts|smc]" >&2
     exit 2
 }
 
@@ -55,28 +62,31 @@ case "$BRANCH" in
     *) echo "unknown branch: $BRANCH (known: jax, original)" >&2; exit 2 ;;
 esac
 
-# laplace|nuts|mclmc|smc are shorthand for solver=jax with that sampler
+# laplace|nuts|smc select the JAX optimizer with that sampler. There is no `jax`
+# solver: `laplace` is the Gaussian one, and naming the sampler avoids the
+# optimizer and the branch being spelled the same way.
 case "$SOLVER" in
-    laplace|nuts|mclmc|smc) JAX_SAMPLER=$SOLVER; SOLVER=jax ;;
-    jax) JAX_SAMPLER=${JAX_SAMPLER:-laplace} ;;
+    laplace|nuts|smc) JAX_SAMPLER=$SOLVER; SOLVER=jax ;;
     multinest) ;;
-    *) echo "unknown solver: $SOLVER (known: multinest, jax, laplace, nuts, mclmc, smc)" >&2; exit 2 ;;
+    *) echo "unknown solver: $SOLVER (known: multinest, laplace, nuts, smc)" >&2; exit 2 ;;
 esac
-if [ "$SOLVER" = jax ]; then
-    case "$JAX_SAMPLER" in
-        laplace|nuts|mclmc|smc) ;;
-        *) echo "unknown sampler: $JAX_SAMPLER (known: laplace, nuts, mclmc, smc)" >&2; exit 2 ;;
-    esac
-    [ "$BRANCH" = jax ] || { echo "solver jax needs branch jax" >&2; exit 2; }
+if [ "$SOLVER" = jax ] && [ "$BRANCH" != jax ]; then
+    echo "solver $JAX_SAMPLER needs branch jax" >&2
+    exit 2
 fi
 
 # ---------------- sampler budget ----------------
-JAX_NUM_SAMPLES=${JAX_NUM_SAMPLES:-1000}
+JAX_NUM_SAMPLES=${JAX_NUM_SAMPLES:-800}
 JAX_NUM_CHAINS=${JAX_NUM_CHAINS:-16}
-JAX_NUM_WARMUP=${JAX_NUM_WARMUP:-200}
+JAX_NUM_WARMUP=${JAX_NUM_WARMUP:-250}
+JAX_MAX_NUM_DOUBLINGS=${JAX_MAX_NUM_DOUBLINGS:-9}
 JAX_NUM_PARTICLES=${JAX_NUM_PARTICLES:-512}
 JAX_SMC_HMC_STEPS=${JAX_SMC_HMC_STEPS:-8}
 JAX_SMC_BATCH_SIZE=${JAX_SMC_BATCH_SIZE:-32}
+JAX_PILOT_WARMUP=${JAX_PILOT_WARMUP:-100}
+JAX_PILOT_SAMPLES=${JAX_PILOT_SAMPLES:-200}
+JAX_PILOT_BLEND=${JAX_PILOT_BLEND:-0.3}
+JAX_PRIOR_DOMINATED_SIGMA=${JAX_PRIOR_DOMINATED_SIGMA:-3}
 
 # The mode is the product only for laplace; for a sampler it just seeds the
 # chain or the proposal, so it stops at a looser gradient and fewer steps.
@@ -85,7 +95,6 @@ case "$JAX_SAMPLER" in
     *)       JAX_FIT_ITERATIONS=100; JAX_GRAD_TOL=1e-4 ;;
 esac
 
-SOLVER_TAG=$SOLVER
 JAX_BLOCK=
 if [ "$SOLVER" = jax ]; then
     SOLVER_TAG=jax_${JAX_SAMPLER}
@@ -93,15 +102,14 @@ if [ "$SOLVER" = jax ]; then
 sampler = ${JAX_SAMPLER}
 num_samples = ${JAX_NUM_SAMPLES}
 max_iterations = ${JAX_FIT_ITERATIONS}
-gradient_tolerance = ${JAX_GRAD_TOL}"
+gradient_tolerance = ${JAX_GRAD_TOL}
+prior_dominated_sigma = ${JAX_PRIOR_DOMINATED_SIGMA}"
     case "$JAX_SAMPLER" in
         nuts)
             JAX_BLOCK="${JAX_BLOCK}
 num_chains = ${JAX_NUM_CHAINS}
-num_warmup = ${JAX_NUM_WARMUP}" ;;
-        mclmc)
-            JAX_BLOCK="${JAX_BLOCK}
-num_chains = ${JAX_NUM_CHAINS}" ;;
+num_warmup = ${JAX_NUM_WARMUP}
+max_num_doublings = ${JAX_MAX_NUM_DOUBLINGS}" ;;
         smc)
             # Start from the mode so the Student-t proposal carries the
             # posterior: when its weights pass the ESS and k-hat checks the run
@@ -112,18 +120,23 @@ num_particles = ${JAX_NUM_PARTICLES}
 num_mcmc_steps = 1
 smc_hmc_steps = ${JAX_SMC_HMC_STEPS}
 smc_start = laplace
-smc_metric = auto
+smc_metric = hessian
 smc_fit = lbfgs
 smc_max_iterations = ${JAX_FIT_ITERATIONS}
-smc_target_ess = 0.5
+smc_target_ess = 0.25
 smc_polish_ess = 0.15
 smc_max_delta = 0.5
 smc_max_steps = 200
 smc_step_size = 0.5
-smc_batch_size = ${JAX_SMC_BATCH_SIZE}" ;;
+smc_batch_size = ${JAX_SMC_BATCH_SIZE}
+pilot_warmup = ${JAX_PILOT_WARMUP}
+pilot_samples = ${JAX_PILOT_SAMPLES}
+pilot_blend = ${JAX_PILOT_BLEND}" ;;
     esac
     JAX_BLOCK="${JAX_BLOCK}
 "
+else
+    SOLVER_TAG=${BRANCH}_multinest
 fi
 
 # the plugin and the sampler's library are needed after the mode fit, so a
@@ -170,7 +183,10 @@ if [ "$SOLVER" = jax ]; then
     CORES=$RANKS_PER_NODE
     LAYOUT_TAG="1n${CORES}c"
     LAYOUT_DESC="1 node, 1 task, ${CORES} cores, no mpirun"
-    SBATCH_LAYOUT="#SBATCH --nodes=1
+    SBATCH_LAYOUT="#SBATCH --output=%x_%j.out
+#SBATCH --error=%x_%j.out
+#SBATCH --open-mode=append
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=${CORES}
 #SBATCH --mem=0
@@ -179,16 +195,19 @@ else
     RANKS_TOTAL=$((NODES * RANKS_PER_NODE))
     LAYOUT_TAG="${NODES}n${RANKS_PER_NODE}r"
     LAYOUT_DESC="${NODES} node(s) x ${RANKS_PER_NODE} ranks/node = ${RANKS_TOTAL} ranks"
-    SBATCH_LAYOUT="#SBATCH --nodes=${NODES}
+    SBATCH_LAYOUT="#SBATCH --output=%x_%j.out
+#SBATCH --error=%x_%j.out
+#SBATCH --open-mode=append
+#SBATCH --nodes=${NODES}
 #SBATCH --ntasks-per-node=${NTASKS_PER_NODE}"
 fi
 
-TAG="${RES_K}k_${LAYOUT_TAG}_${BRANCH}_${SOLVER_TAG}"
+TAG="${RES_K}k_${LAYOUT_TAG}_${SOLVER_TAG}"
 PARFILE="parfile_${TAG}.par"
 OUTPUT="output_${TAG}.hdf5"
 MULTI="multi_${TAG}"
-LABEL="mem_${LAYOUT_TAG}_${RES_K}k_${BRANCH}_${SOLVER_TAG}"
-JOB_NAME="taurex-${RES_K}k-${LAYOUT_TAG}-${BRANCH}-${SOLVER_TAG}"
+LABEL="mem_${TAG}"
+JOB_NAME="taurex-${RES_K}k-${LAYOUT_TAG}-${SOLVER_TAG}"
 
 if [ "$SOLVER" = jax ]; then
     # --cpu-bind=none keeps Slurm from pinning the task to one core, which would

@@ -21,10 +21,9 @@ A fit is therefore a handful of XLA programs with no python callback between
 them.
 
 What happens after the mode is chosen depends on the ``sampler`` option:
-``laplace`` draws from the Gaussian, ``importance`` reweights Student-t
-proposals, ``nuts`` and ``mclmc`` run exact and microcanonical chains, and
-``smc`` tempers a particle population and returns the evidence alongside the
-posterior.
+``laplace`` draws from the Gaussian, ``nuts`` runs an exact Hamiltonian chain,
+and ``smc`` tempers a particle population and returns the evidence alongside
+the posterior.
 
 The quasi-Newton step itself is :func:`optax.lbfgs`, an L-BFGS with a
 strong-Wolfe zoom line search, which is the same algorithm the torch
@@ -483,6 +482,7 @@ class LaplaceOptimizer(Optimizer):
         smc_fit_tolerance: t.Optional[float] = 1e-4,
         smc_max_iterations: t.Optional[int] = 60,
         eigenvalue_floor: t.Optional[float] = 1e-3,
+        prior_dominated_sigma: t.Optional[float] = 3.0,
         seed: t.Optional[int] = 0,
         device: t.Optional[str] = None,
         sigma_fraction: t.Optional[float] = 0.02,
@@ -579,6 +579,19 @@ class LaplaceOptimizer(Optimizer):
             curvature sit orders of magnitude above it and keep their exact
             inverse.
 
+        prior_dominated_sigma:
+            How far a parameter's *data* error bar has to exceed its prior
+            standard deviation before the sampler treats it as prior dominated
+            (default 3; ``None`` or 0 disables). The data curvature is the
+            Hessian of the negative log likelihood at the mode minus the
+            prior-and-Jacobian curvature, so only the observation is tested. A
+            prior-dominated direction has a posterior equal to the prior, but
+            the clipped Laplace covariance can still be far narrower than the
+            prior there, which stretches the whitened target and lengthens
+            every trajectory. Such a direction is whitened with the prior's own
+            variance in ``u`` (the logistic ``pi^2/3``) instead. The sampler's
+            target is unchanged: it already samples the prior there.
+
         seed:
             Seed for the posterior draws, so a retrieval is reproducible
 
@@ -603,29 +616,9 @@ class LaplaceOptimizer(Optimizer):
             the mode, with the Laplace covariance as its initial inverse mass
             matrix, and returns exact, equally weighted posterior draws. Use
             ``nuts`` when the posterior is not Gaussian or when the error bars
-            from the Laplace approximation look suspect.
-            ``importance`` reweights proposals drawn from a Student-t centred
-            on the mode with the Laplace covariance by the exact density. It
-            costs one forward pass per proposal and no gradients, and the
-            effective sample size it reports says how much of the posterior
-            the Gaussian captured: high means the Laplace description was
-            right, low means neither it nor these draws can be trusted. The
-            proposals are returned with their weights, so the reported
-            quantiles and covariance use the importance weights instead of
-            pretending the proposals are independent; the Pareto tail index
-            ``k-hat`` is reported and warns above 0.7, where a few proposals
-            decide the answer.
-            ``mclmc`` runs Microcanonical Langevin Monte Carlo from
-            :mod:`blackjax`, which produces one sample per gradient rather
-            than the tens to hundreds a NUTS trajectory needs, and needs no
-            accept/reject and no trajectory length. It is the option to use
-            when the posterior is genuinely non-Gaussian and the gradient is
-            too expensive for NUTS; it needs at least two fitted parameters.
-            Every chain starts at the mode found by the fit, so the draws
-            describe the basin around that mode and nothing else: agreement
-            between its chains is not evidence that another region of the
-            prior does not carry posterior mass, and a nested sampler is the
-            only one of these that can answer that.
+            from the Laplace approximation look suspect. The chains start at
+            the mode, so they describe that basin; only a nested sampler can
+            answer whether another region of the prior carries posterior mass.
             ``smc`` runs adaptive tempered Sequential Monte Carlo with a
             fixed-length HMC kernel, the particle filter version of the same
             gradient sampler. It draws a defensive mixture of a Student-t
@@ -657,15 +650,12 @@ class LaplaceOptimizer(Optimizer):
             sensible default; the base point itself is always included.
 
         num_warmup:
-            Warm-up steps for the NUTS window adaptation, per chain. NUTS only:
-            ``mclmc`` spends about a third of its own number of steps tuning
-            its step size and trajectory length, and ``importance`` and
-            ``laplace`` need no warm-up at all.
+            Warm-up steps for the NUTS window adaptation, per chain. ``laplace``
+            and ``smc`` need no warm-up of their own.
 
         num_chains:
-            Number of chains, for the samplers that run chains (``nuts`` and
-            ``mclmc``). The posterior draws are split evenly across them, so a
-            chain run also gives a crude convergence check.
+            Number of NUTS chains. The posterior draws are split evenly across
+            them, so a chain run also gives a crude convergence check.
 
         max_num_doublings:
             Longest NUTS trajectory, as a power of two: a draw integrates at
@@ -855,15 +845,19 @@ class LaplaceOptimizer(Optimizer):
             )
         self.smc_max_iterations = max(1, int(smc_max_iterations))
         self.eigenvalue_floor = float(eigenvalue_floor)
+        self.prior_dominated_sigma = (
+            None
+            if prior_dominated_sigma is None or float(prior_dominated_sigma) <= 0.0
+            else float(prior_dominated_sigma)
+        )
         self.seed = seed
         self.device = None if device is None else jax.devices(device)[0]
         self.ignored_options = kwargs
 
         self.sampler = str(sampler).lower()
-        if self.sampler not in ("laplace", "nuts", "importance", "mclmc", "smc"):
+        if self.sampler not in ("laplace", "nuts", "smc"):
             raise ValueError(
-                f"Unknown sampler {sampler!r}; use 'laplace', 'nuts', "
-                "'importance', 'mclmc' or 'smc'"
+                f"Unknown sampler {sampler!r}; use 'laplace', 'nuts' or 'smc'"
             )
         self.n_starts = max(1, int(n_starts))
         self.start_scale = float(start_scale)
@@ -997,6 +991,19 @@ class LaplaceOptimizer(Optimizer):
         from taurex.mpi import broadcast
         from taurex.mpi import get_rank
         from taurex.mpi import nprocs
+
+        import logging
+
+        # The input-file driver leaves the root logger at CRITICAL so the numpy
+        # model does not flood the log. Raising this optimizer's own logger is
+        # what makes the mode fit, the NUTS trajectory length and the SMC stages
+        # visible; on a multi-hour run it is the only progress reported, and a
+        # silent sampler is indistinguishable from a hung one.
+        self._logger.setLevel(logging.INFO)
+        # Which copy of the package is running. A retrieval on a cluster is
+        # usually installed from a wheel or a copy of ``src``; printing the file
+        # is the one line that says whether a reinstall took effect.
+        self.info("JAX optimizer loaded from %s", __file__)
 
         rank = get_rank()
         size = nprocs()
@@ -1617,12 +1624,14 @@ class LaplaceOptimizer(Optimizer):
                         "and the first stages use the prior scale and the HMC "
                         "metric follows the particles"
                     )
+                full_hessian = None
                 if covariance_u is None:
                     nuts_hessian_of = jax.jit(
                         jax.hessian(nuts_objective), device=self.device
                     )
-                    covariance, variance_scale = self._laplace_covariance(
-                        nuts_hessian_of, u_map
+                    full_hessian = np.asarray(nuts_hessian_of(u_map))
+                    covariance, variance_scale = self._covariance_from_hessian(
+                        full_hessian
                     )
                     covariance_u = covariance * variance_scale
                     if not self._is_usable_covariance(covariance_u):
@@ -1630,6 +1639,23 @@ class LaplaceOptimizer(Optimizer):
                             lbfgs_covariance = self._lbfgs_covariance(
                                 lbfgs_state, u.shape[0]
                             )
+                if self.prior_dominated_sigma and covariance_u is not None:
+                    # The data curvature is the full Hessian minus its prior and
+                    # Jacobian part; a direction it does not constrain has the
+                    # prior as its posterior, and the prior's variance is the
+                    # right whitening there.
+                    if full_hessian is None:
+                        full_hessian = np.asarray(
+                            jax.jit(
+                                jax.hessian(nuts_objective), device=self.device
+                            )(u_map)
+                        )
+                    prior_hessian = np.asarray(
+                        jax.jit(jax.hessian(log_prior_u), device=self.device)(u_map)
+                    )
+                    covariance_u = self._adjust_for_prior_dominated(
+                        full_hessian, prior_hessian, np.asarray(covariance_u)
+                    )
                 self._u_covariance = covariance_u
             else:
                 covariance_u = None
@@ -1693,20 +1719,31 @@ class LaplaceOptimizer(Optimizer):
                     (self._n_physical, self._n_physical), dtype=float
                 )
         else:
-            if self.sampler != "laplace":
+            if self.sampler == "nuts":
                 # The mass matrix has to describe the same density the sampler
                 # targets, so the Hessian here includes the transform Jacobian.
                 nuts_hessian_of = jax.jit(
                     jax.hessian(nuts_objective), device=self.device
                 )
-                covariance, variance_scale = self._laplace_covariance(
-                    nuts_hessian_of, u_map
+                full_hessian = np.asarray(nuts_hessian_of(u_map))
+                covariance, variance_scale = self._covariance_from_hessian(
+                    full_hessian
                 )
+                if self.prior_dominated_sigma and variance_scale > 0.0:
+                    prior_hessian = np.asarray(
+                        jax.jit(jax.hessian(log_prior_u), device=self.device)(u_map)
+                    )
+                    covariance_u = self._adjust_for_prior_dominated(
+                        full_hessian,
+                        prior_hessian,
+                        np.asarray(covariance) * variance_scale,
+                    )
+                    covariance = covariance_u / variance_scale
             else:
                 covariance, variance_scale = self._laplace_covariance(
                     hessian_of, u_map
                 )
-            self._u_covariance = covariance * variance_scale
+            self._u_covariance = np.asarray(covariance) * variance_scale
             if self.sampler == "nuts" and self.pilot_samples > 0:
                 scale = float(variance_scale)
                 if scale > 0.0:
@@ -1719,68 +1756,25 @@ class LaplaceOptimizer(Optimizer):
                         covariance = pilot_covariance / scale
                         self._u_covariance = pilot_covariance
                         self._pilot_parameters = pilot_info
-            if self.sampler != "laplace":
-                if self.sampler == "nuts":
-                    self._samples = self._run_nuts(
-                        nuts_objective,
-                        u_map,
-                        covariance,
-                        variance_scale,
-                        transform_of,
-                    )
-                elif self.sampler == "importance":
-                    self._samples, self._weights = self._run_importance_sampling(
-                        nuts_objective,
-                        u_map,
-                        covariance,
-                        variance_scale,
-                        transform_of,
+            if self.sampler == "nuts":
+                self._samples = self._run_nuts(
+                    nuts_objective,
+                    u_map,
+                    covariance,
+                    variance_scale,
+                    transform_of,
+                )
+                # NUTS draws from the posterior itself, so its draws carry
+                # equal weight.
+                self._median = np.median(self._samples, axis=0)
+                if self._samples.shape[0] > 1:
+                    self._covariance = np.atleast_2d(
+                        np.cov(self._samples, rowvar=False)
                     )
                 else:
-                    self._samples = self._run_mclmc(
-                        nuts_objective,
-                        u_map,
-                        covariance,
-                        variance_scale,
-                        transform_of,
+                    self._covariance = np.zeros(
+                        (self._n_physical, self._n_physical), dtype=float
                     )
-                # NUTS and MCLMC draw from the posterior itself, so their
-                # draws carry equal weight. Importance sampling returns the
-                # weights of its proposals instead, because resampling them
-                # would make the reported errors too small.
-                if self._weights is None:
-                    self._median = np.median(self._samples, axis=0)
-                    if self._samples.shape[0] > 1:
-                        self._covariance = np.atleast_2d(
-                            np.cov(self._samples, rowvar=False)
-                        )
-                    else:
-                        self._covariance = np.zeros(
-                            (self._n_physical, self._n_physical), dtype=float
-                        )
-                else:
-                    self._median = np.array(
-                        [
-                            quantile_corner(
-                                self._samples[:, index],
-                                [0.5],
-                                weights=self._weights,
-                            )[0]
-                            for index in range(self._n_physical)
-                        ]
-                    )
-                    if np.count_nonzero(self._weights) > 1:
-                        self._covariance = np.atleast_2d(
-                            np.cov(
-                                self._samples,
-                                rowvar=False,
-                                aweights=self._weights,
-                            )
-                        )
-                    else:
-                        self._covariance = np.zeros(
-                            (self._n_physical, self._n_physical), dtype=float
-                        )
             else:
                 draws_full = self._draw_samples(
                     u_map, covariance, variance_scale, transform_of
@@ -1851,8 +1845,8 @@ class LaplaceOptimizer(Optimizer):
         posterior, the weights are the answer and the run spends no gradient
         at all; when it does not, the run starts at the largest
         :math:`\\beta` whose weights are still effective and corrects the rest
-        with HMC. This is the same proposal the importance sampler uses, with
-        SMC as the fallback that makes it exact where the proposal fails.
+        with HMC. Those weights are themselves an importance estimate of the
+        evidence, and SMC makes it exact where the proposal fails.
 
         ``smc_start='prior'`` instead draws from the prior and tempers from
         zero. It reaches modes the proposal cannot, at the price of far more
@@ -1890,14 +1884,6 @@ class LaplaceOptimizer(Optimizer):
         from blackjax.smc import tempered as smc_tempered
         from blackjax.smc.resampling import systematic
         from scipy import special as scipy_special
-
-        import logging
-
-        # ``compute_fit`` runs with the root logger at CRITICAL so that the
-        # numpy model does not flood the log, which would also hide the only
-        # progress this sampler reports. Raising this optimizer's own logger
-        # shows the stages without re-enabling everything else.
-        self._logger.setLevel(logging.INFO)
 
         dtype = jnp.float64
         from taurex.mpi import get_rank, nprocs
@@ -2113,6 +2099,19 @@ class LaplaceOptimizer(Optimizer):
             self.info(
                 "SMC: pilot skipped in the sharded layout; SMC_MPI=0 runs it "
                 "on one process"
+            )
+
+        # The proposal is only as good as this covariance: too narrow and the
+        # importance weights collapse to one particle (ESS 1), too broad and
+        # they are flat. Printing its spectrum is what separates a bad mode fit
+        # from a bad covariance when the proposal ESS is low.
+        if np.all(np.isfinite(covariance_np)):
+            spectrum = np.linalg.eigvalsh(0.5 * (covariance_np + covariance_np.T))
+            self.info(
+                "SMC: proposal covariance spans %.2e to %.2e in u (ratio %.1e)",
+                float(spectrum[0]),
+                float(spectrum[-1]),
+                float(spectrum[-1] / max(spectrum[0], np.finfo(float).tiny)),
             )
 
         if usable_covariance:
@@ -3356,6 +3355,12 @@ class LaplaceOptimizer(Optimizer):
 
         dimension = u_map.shape[0]
         covariance_u = covariance * variance_scale
+        eigenvalues = np.linalg.eigvalsh(np.asarray(covariance_u, dtype=float))
+        self.info(
+            "NUTS: Laplace whitening spans %.2e to %.2e in u",
+            float(eigenvalues[0]),
+            float(eigenvalues[-1]),
+        )
         # The sampler runs in coordinates whitened by the Laplace covariance:
         # ``u = u_map + factor @ v`` with ``factor`` the Cholesky factor of the
         # Laplace covariance. Whatever the parameter scales, the posterior is
@@ -3525,402 +3530,13 @@ class LaplaceOptimizer(Optimizer):
                 (steps_per_chain - done) * per_step,
             )
         positions_v = jnp.concatenate(blocks, axis=1).reshape(-1, dimension)
-        positions = u_map[None, :] + positions_v @ factor.T
-        theta = transform_of(positions)
-        return np.asarray(theta[:, : self._n_physical]).copy()
-
-    def _run_importance_sampling(
-        self,
-        objective: t.Callable[[Array], Array],
-        u_map: Array,
-        covariance: Array,
-        variance_scale: float,
-        transform_of: t.Callable[[Array], Array],
-    ) -> npt.NDArray[np.float64]:
-        """Draw posterior samples by reweighting a proposal around the mode.
-
-        A draw from a gradient sampler costs a trajectory of model gradients;
-        a draw from a proposal costs one forward pass. When the Laplace
-        Gaussian is close to the posterior, drawing proposals from it and
-        reweighting each by ``posterior / proposal`` therefore gives posterior
-        draws for the price of a few thousand model evaluations instead of a
-        few hundred thousand gradients, and the effective sample size measures
-        how close the Gaussian was: a nearly uniform weight distribution means
-        the Gaussian is the posterior, a collapsed one says it is not and that
-        neither the Laplace errors nor these draws describe it.
-
-        The proposal is a Student-t with four degrees of freedom rather than a
-        Gaussian, because the weights of a Gaussian proposal are unbounded
-        where the posterior has longer tails than the Laplace approximation;
-        the polynomial tails of the t make the ratio decay there whatever the
-        posterior does. In the whitened coordinates the t has unit scale, which
-        gives it twice the Laplace variance.
-
-        Parameters
-        ----------
-        objective:
-            Negative log posterior including the transform Jacobian
-
-        u_map:
-            Location of the mode
-
-        covariance:
-            Covariance of the scaled unconstrained space
-
-        variance_scale:
-            Factor that turns it into the covariance of ``u``
-
-        transform_of:
-            Compiled map from ``u`` to the parameters
-
-        Returns
-        -------
-        samples, weights:
-            The proposals in parameter space, shape ``(num_samples, nparams)``,
-            and their normalised importance weights. The proposals are not
-            resampled: resampling with replacement would turn ``effective``
-            independent draws into ``num_samples`` equally weighted ones and
-            make every reported error too small by ``sqrt(num_samples /
-            effective)``.
-
-        """
-        dimension = u_map.shape[0]
-        covariance_u = covariance * variance_scale
-        factor = jnp.linalg.cholesky(covariance_u)
-        degrees = 4.0
-        num = self.num_samples
-
-        key = jax.random.PRNGKey(0 if self.seed is None else int(self.seed))
-        key, normal_key, chi_key = jax.random.split(key, 3)
-        normal = jax.random.normal(
-            normal_key, (num, dimension), dtype=covariance_u.dtype
-        )
-        chi = jax.random.chisquare(chi_key, degrees, (num,), dtype=covariance_u.dtype)
-        # A t variate is a normal divided by the square root of a chi-square
-        # over its degrees of freedom, which is what makes the tails polynomial.
-        whitened = normal * jnp.sqrt(degrees / chi)[:, None]
-
-        _, logdet = jnp.linalg.slogdet(covariance_u)
-
-        def log_proposal(v: Array) -> Array:
-            """Log density of the proposal at a whitened point."""
-            quadratic = jnp.sum(v * v, axis=-1)
-            return (
-                jax.scipy.special.gammaln(0.5 * (degrees + dimension))
-                - jax.scipy.special.gammaln(0.5 * degrees)
-                - 0.5 * dimension * jnp.log(degrees * jnp.pi)
-                - 0.5 * (degrees + dimension) * jnp.log1p(quadratic / degrees)
-                - 0.5 * logdet
-            )
-
-        def log_weight(v: Array) -> Array:
-            return -objective(u_map + v @ factor.T) - log_proposal(v)
-
-        # The density is evaluated a batch at a time for the same reason the
-        # profile bands are: each draw holds several ``(nlayers, nwn)`` arrays,
-        # and a few thousand of them at once is gigabytes.
-        atmosphere = self.atmosphere
-        per_draw = (
-            atmosphere.wngrid.dtype.itemsize
-            * atmosphere.model.nLayers
-            * atmosphere.wngrid.shape[0]
-            * 2
-        )
-        batch = max(1, _PROFILE_BATCH_BYTES // max(per_draw, 1))
-        log_weights = np.asarray(
-            jax.block_until_ready(jax.lax.map(log_weight, whitened, batch_size=batch))
-        )
-
-        weights = np.exp(log_weights - log_weights.max())
-        total = float(weights.sum())
-        weights = weights / total
-        effective = 1.0 / float(np.sum(weights**2))
-        k_hat = _pareto_khat(log_weights)
         self.info(
-            "Importance sampling: %d proposals, effective sample size %.0f "
-            "(%.1f%% of them), largest weight %.3f, tail index k-hat %.2f",
-            num,
-            effective,
-            100.0 * effective / num,
-            float(weights.max()),
-            k_hat,
+            "NUTS: finished %d draws in %.0f s, %.0f gradient evaluations per "
+            "draw",
+            done * self.num_chains,
+            time.perf_counter() - started,
+            leapfrogs / max(done * self.num_chains, 1),
         )
-        if effective < 0.1 * num:
-            self.warning(
-                "Importance sampling is degenerate: the effective sample size "
-                "is %.0f of %d proposals, so these draws carry the information "
-                "of %.0f independent points and the weights are dominated by "
-                "a few of them; the Laplace Gaussian is not a good description "
-                "of this posterior. Raise num_samples, or use sampler='nuts' "
-                "for exact draws at the cost of gradients",
-                effective,
-                num,
-                effective,
-            )
-        if k_hat > _SMC_MAX_KHAT:
-            self.warning(
-                "Importance sampling: the weight tail index is k-hat %.2f, "
-                "above the trust limit %.2f, so the largest weights decide "
-                "these draws and their errors. Raise num_samples, or use "
-                "sampler='smc', which tempers the proposal instead of "
-                "trusting it",
-                k_hat,
-                _SMC_MAX_KHAT,
-            )
-
-        # The proposals are returned with their weights instead of being
-        # resampled: a resample with replacement would make the quantiles and
-        # the covariance below treat `effective` independent draws as
-        # `num_samples` independent ones, which understates every error bar.
-        positions = u_map[None, :] + whitened @ factor.T
-        theta = transform_of(positions)
-        return (
-            np.asarray(theta[:, : self._n_physical]).copy(),
-            weights,
-        )
-
-    def _run_mclmc(
-        self,
-        objective: t.Callable[[Array], Array],
-        u_map: Array,
-        covariance: Array,
-        variance_scale: float,
-        transform_of: t.Callable[[Array], Array],
-    ) -> npt.NDArray[np.float64]:
-        """Draw posterior samples with Microcanonical Langevin Monte Carlo.
-
-        MCLMC integrates a Hamiltonian flow on a fixed energy shell, with no
-        momentum refreshment and no Metropolis test, so one step costs one
-        gradient and yields one sample, where a NUTS draw spends tens to
-        hundreds of gradients building and probing a trajectory. What it gives
-        up is exactness: the discretisation error is ``O(step_size**2)`` rather
-        than zero, and nothing here corrects it after the fact - blackjax's
-        energy-variance cutoff is off at its default of
-        ``desired_energy_var_max_ratio=inf``, so only steps that produce a NaN
-        are reverted. The step size the tuning settles on is what keeps the
-        energy change per step small, and ``L`` sets how far the flow travels
-        before its momentum is redrawn.
-
-        The Laplace covariance whitens the target, which is what lets one step
-        size and one ``L`` work across directions whose parameter scales differ
-        by orders of magnitude; the tuning therefore only has to find those two
-        numbers and not a preconditioner as well.
-
-        Parameters
-        ----------
-        objective:
-            Negative log posterior including the transform Jacobian
-
-        u_map:
-            Location of the mode
-
-        covariance:
-            Covariance of the scaled unconstrained space
-
-        variance_scale:
-            Factor that turns it into the covariance of ``u``
-
-        transform_of:
-            Compiled map from ``u`` to the parameters
-
-        Returns
-        -------
-        :obj:`numpy.ndarray`
-            Posterior draws in parameter space, shape ``(nsamples, nparams)``
-
-        """
-        import blackjax.mcmc.mclmc as mclmc
-        from blackjax.adaptation.mclmc_adaptation import mclmc_find_L_and_step_size
-
-        dimension = u_map.shape[0]
-        if dimension < 2:
-            raise ValueError(
-                "MCLMC needs at least two fitted parameters, because blackjax "
-                "refuses a one dimensional target; use sampler='nuts' for a "
-                "single parameter"
-            )
-        covariance_u = covariance * variance_scale
-        factor = jnp.linalg.cholesky(covariance_u)
-
-        def logdensity_v(v: Array) -> Array:
-            return -objective(u_map + factor @ v)
-
-        key = jax.random.PRNGKey(0 if self.seed is None else int(self.seed))
-        key, init_key, tune_key, sample_key = jax.random.split(key, 4)
-        steps_per_chain = max(1, self.num_samples // self.num_chains)
-        kernel = mclmc.build_kernel()
-        start = mclmc.init(
-            jnp.zeros(dimension, dtype=covariance_u.dtype), logdensity_v, init_key
-        )
-        # The whitening is only as accurate as the Hessian it came from, and a
-        # covariance that is wrong by a large factor in some direction leaves
-        # the whitened target anisotropic: one step size then has to serve the
-        # narrowest and the widest direction at once, and a chain of a few
-        # hundred steps covers only the narrow ones - the draws collapse around
-        # the mode and look like the Laplace Gaussian they were supposed to
-        # correct. The diagonal preconditioner costs about a quarter more tuning
-        # steps and measures that residual variance from the tuning draws,
-        # which makes the geometry isotropic again whatever the whitening got
-        # wrong.
-        self.info(
-            "MCLMC: tuning the step size, trajectory length and diagonal "
-            "preconditioner over about a third of %d steps per chain",
-            steps_per_chain,
-        )
-        state, parameters, tuning_steps = mclmc_find_L_and_step_size(
-            mclmc_kernel=kernel,
-            logdensity_fn=logdensity_v,
-            num_steps=max(steps_per_chain, 100),
-            state=start,
-            rng_key=tune_key,
-            diagonal_preconditioning=True,
-        )
-        step_size, length = jax.block_until_ready(
-            (parameters.step_size, parameters.L)
-        )
-        self.info(
-            "MCLMC: step size %.3g and trajectory length %.3g after %d "
-            "tuning steps; %d chains x %d steps, one gradient each",
-            float(step_size),
-            float(length),
-            int(tuning_steps),
-            self.num_chains,
-            steps_per_chain,
-        )
-        sampler = mclmc.as_top_level_api(
-            logdensity_v,
-            L=parameters.L,
-            step_size=parameters.step_size,
-            inverse_mass_matrix=parameters.inverse_mass_matrix,
-        )
-
-        def run_block(
-            states: t.Any, keys: t.Any
-        ) -> t.Tuple[t.Any, t.Tuple[Array, Array]]:
-            """Advance every chain by ``keys.shape[1]`` steps in one program.
-
-            Besides the positions, whether each step was clean is returned: a
-            step that produced a NaN is reverted by the kernel, so a chain whose
-            steps are all reverted stays where it started and its draws are a
-            spike at the mode rather than a posterior.
-            """
-
-            def one_chain(
-                current: t.Any, chain_keys: Array
-            ) -> t.Tuple[t.Any, t.Tuple[Array, Array]]:
-                def one_step(
-                    current: t.Any, step_key: Array
-                ) -> t.Tuple[t.Any, t.Tuple[Array, Array]]:
-                    current, info = sampler.step(step_key, current)
-                    return current, (current.position, info.nonans)
-
-                return jax.lax.scan(one_step, current, chain_keys)
-
-            return jax.vmap(one_chain)(states, keys)
-
-        run_block = jax.jit(run_block)
-        # The tuning produced one chain with one momentum. Starting every chain
-        # at the tuned position with its own key gives each an independent
-        # momentum and a recomputed gradient, which costs one gradient per
-        # chain and makes them independent chains instead of four copies of the
-        # same deterministic flow.
-        init_key, step_key = jax.random.split(sample_key)
-        init_keys = jax.random.split(init_key, self.num_chains)
-        states = jax.vmap(lambda x, k: mclmc.init(x, logdensity_v, k))(
-            jnp.broadcast_to(state.position, (self.num_chains, dimension)), init_keys
-        )
-        step_keys = jax.vmap(lambda k: jax.random.split(k, steps_per_chain))(
-            jax.random.split(step_key, self.num_chains)
-        )
-        # Every step costs the same here, so unlike NUTS there is no trajectory
-        # length to discover: the blocks exist only to report progress, and the
-        # size of the first two measures the cost of a step without the
-        # compilation folded in.
-        probe = max(1, steps_per_chain // _NUTS_PROGRESS_PROBE)
-        block = probe
-        probe_calls = 0
-        per_step: t.Optional[float] = None
-        blocks: t.List[Array] = []
-        clean = 0
-        done = 0
-        started = time.perf_counter()
-        while done < steps_per_chain:
-            size = min(block, steps_per_chain - done)
-            call_started = time.perf_counter()
-            states, (block_positions, block_clean) = run_block(
-                states, step_keys[:, done : done + size]
-            )
-            blocks.append(jax.block_until_ready(block_positions))
-            clean += int(np.asarray(jax.block_until_ready(block_clean)).sum())
-            done += size
-            call_time = time.perf_counter() - call_started
-            if per_step is None:
-                probe_calls += 1
-                if probe_calls < 2 and done + probe <= steps_per_chain:
-                    continue
-                per_step = call_time / size
-                block = max(
-                    probe,
-                    min(steps_per_chain, int(_NUTS_PROGRESS_INTERVAL / per_step)),
-                )
-            self.info(
-                "MCLMC: %d/%d steps per chain (%.0f%%), %.0f s elapsed, "
-                "about %.0f s left",
-                done,
-                steps_per_chain,
-                100.0 * done / steps_per_chain,
-                time.perf_counter() - started,
-                (steps_per_chain - done) * per_step,
-            )
-
-        # Two numbers decide whether these draws are a posterior or a spike at
-        # the mode. Reverted steps say whether the flow is running at all. The
-        # spread in the whitened coordinates says whether the walk covered the
-        # target: an accurate whitening puts the posterior at a spread of 1 in
-        # every coordinate, so a spread far below 1 is a chain that stayed near
-        # its starting point, and a spread far above 1 is a posterior wider than
-        # the Laplace covariance, which makes the Laplace error bars too small.
-        positions_v = jnp.concatenate(blocks, axis=1).reshape(-1, dimension)
-        taken = done * self.num_chains
-        reverted = taken - clean
-        spread = np.std(np.asarray(positions_v), axis=0)
-        self.info(
-            "MCLMC: %d of %d steps reverted (%.1f%%); the draws span %.2f to "
-            "%.2f in the whitened coordinates, where the Laplace Gaussian is 1",
-            reverted,
-            taken,
-            100.0 * reverted / max(taken, 1),
-            float(np.min(spread)),
-            float(np.max(spread)),
-        )
-        if reverted > taken // 2:
-            self.warning(
-                "MCLMC: %d of %d steps produced a NaN and were reverted, so "
-                "the chains stayed where they started and these draws are that "
-                "starting point, not a posterior. The whole run spans %.2f in "
-                "the whitened coordinates, where it should be about 1",
-                reverted,
-                taken,
-                float(np.max(spread)),
-            )
-        elif float(np.max(spread)) < 0.2:
-            self.warning(
-                "MCLMC: the draws span only %.2f of the whitened posterior, "
-                "whose scale is 1, so the chains moved by a hundredth of their "
-                "own width and these draws are not the posterior. Raise "
-                "num_samples (the cost is one gradient per step) or check the "
-                "step size %.3g above",
-                float(np.max(spread)),
-                float(step_size),
-            )
-        elif float(np.median(spread)) > 3.0:
-            self.warning(
-                "MCLMC: the posterior is %.1f times wider than the Laplace "
-                "covariance along its median direction, so the Laplace error "
-                "bars understate it; the draws here are the ones to use",
-                float(np.median(spread)),
-            )
-
         positions = u_map[None, :] + positions_v @ factor.T
         theta = transform_of(positions)
         return np.asarray(theta[:, : self._n_physical]).copy()
@@ -4293,7 +3909,28 @@ class LaplaceOptimizer(Optimizer):
         and leaving them in JAX compiles one small program per operation.
 
         """
-        hessian = np.asarray(hessian_of(u_map))
+        return self._covariance_from_hessian(np.asarray(hessian_of(u_map)))
+
+    def _covariance_from_hessian(
+        self, hessian: npt.NDArray[np.float64]
+    ) -> t.Tuple[npt.NDArray[np.float64], float]:
+        """Inverse of a symmetric Hessian with its spectrum clipped.
+
+        Parameters
+        ----------
+        hessian:
+            Hessian of the negative log posterior in ``u``
+
+        Returns
+        -------
+        covariance:
+            Covariance in the scaled space
+
+        variance_scale:
+            Factor that turns it into the covariance of ``u``
+
+        """
+        hessian = np.asarray(hessian, dtype=float)
         hessian = 0.5 * (hessian + hessian.T)
 
         largest = float(np.max(np.abs(hessian)))
@@ -4323,6 +3960,138 @@ class LaplaceOptimizer(Optimizer):
         covariance = np.linalg.inv(clipped)
         covariance = 0.5 * (covariance + covariance.T)
         return covariance, 1.0 / largest
+
+    @staticmethod
+    def _prior_dominated(
+        full_hessian: npt.NDArray[np.float64],
+        prior_hessian: npt.NDArray[np.float64],
+        n_physical: int,
+        sigma: float,
+    ) -> npt.NDArray[np.bool_]:
+        """Coordinates whose data curvature is negligible against the prior.
+
+        ``full_hessian`` and ``prior_hessian`` are the Hessians of the full
+        negative log posterior in ``u`` and of its prior-and-Jacobian part.
+        Their difference is the data curvature, and ``1 / sqrt(curvature)`` is
+        the local data error bar in ``u``. The prior in ``u`` of a bounded
+        parameter is the logistic density, whose standard deviation is
+        ``pi / sqrt(3)``. A coordinate is prior dominated when the data error
+        bar is ``sigma`` times that, because the data then adds less than
+        ``1 / sigma**2`` of the prior precision and the posterior there is the
+        prior to within that much.
+
+        Parameters
+        ----------
+        full_hessian:
+            Hessian of the negative log posterior in ``u``, Jacobian included
+
+        prior_hessian:
+            Hessian of the negative log prior in ``u``, Jacobian included
+
+        n_physical:
+            Number of physical parameters; the jitter coordinate is never
+            treated as prior dominated
+
+        sigma:
+            Data-to-prior standard deviation ratio at which a coordinate counts
+            as prior dominated
+
+        Returns
+        -------
+        :obj:`numpy.ndarray`
+            Boolean mask of length ``n_physical``
+        """
+        full = np.asarray(full_hessian, dtype=float)
+        prior = np.asarray(prior_hessian, dtype=float)
+        curvature = np.diag(full - prior)[:n_physical]
+        safe = np.where(curvature > 0.0, curvature, 1.0)
+        data_error = 1.0 / np.sqrt(safe)
+        prior_error = np.sqrt(np.pi**2 / 3.0)
+        return (curvature <= 0.0) | (data_error >= sigma * prior_error)
+
+    @staticmethod
+    def _prior_scale_covariance(
+        covariance_u: npt.NDArray[np.float64],
+        mask: npt.NDArray[np.bool_],
+    ) -> npt.NDArray[np.float64]:
+        """Give the prior-dominated coordinates the prior's own variance.
+
+        The sampler target is unchanged: those coordinates are already sampled
+        from their prior. Only the whitening and the SMC proposal use this
+        covariance, and a coordinate whose data curvature was replaced by the
+        clipped floor can be orders of magnitude narrower than its prior, which
+        stretches the whitened target and lengthens every trajectory. The prior
+        is independent across coordinates, so the correlations with the rest are
+        dropped.
+
+        Parameters
+        ----------
+        covariance_u:
+            Covariance in ``u`` space
+
+        mask:
+            Coordinates to replace
+
+        Returns
+        -------
+        :obj:`numpy.ndarray`
+            Covariance with those coordinates at the prior scale
+        """
+        covariance = np.array(covariance_u, dtype=float, copy=True)
+        if not np.any(mask):
+            return covariance
+        indices = np.flatnonzero(mask)
+        covariance[indices, :] = 0.0
+        covariance[:, indices] = 0.0
+        covariance[indices, indices] = np.pi**2 / 3.0
+        return 0.5 * (covariance + covariance.T)
+
+    def _adjust_for_prior_dominated(
+        self,
+        full_hessian: npt.NDArray[np.float64],
+        prior_hessian: npt.NDArray[np.float64],
+        covariance_u: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        """Reset the prior-dominated coordinates of a covariance.
+
+        Parameters
+        ----------
+        full_hessian:
+            Hessian of the negative log posterior in ``u``
+
+        prior_hessian:
+            Hessian of its prior-and-Jacobian part
+
+        covariance_u:
+            Covariance or metric in ``u`` space
+
+        Returns
+        -------
+        :obj:`numpy.ndarray`
+            The covariance, with the prior-dominated coordinates replaced
+        """
+        if not self.prior_dominated_sigma:
+            return covariance_u
+        mask = self._prior_dominated(
+            full_hessian,
+            prior_hessian,
+            self._n_physical,
+            self.prior_dominated_sigma,
+        )
+        if not mask.any():
+            return covariance_u
+        indices = np.flatnonzero(mask)
+        self.info(
+            "Sampler: %d of %d parameters prior dominated (%s): the data adds "
+            "under %.2g of their prior precision, so their whitening uses the "
+            "prior scale; effective dimension %d",
+            int(indices.size),
+            self._n_physical,
+            ", ".join(self.fit_names[index] for index in indices),
+            1.0 / self.prior_dominated_sigma**2,
+            self._n_physical - int(indices.size),
+        )
+        return self._prior_scale_covariance(np.asarray(covariance_u), mask)
 
     def _parameter_covariance(
         self,
@@ -4462,8 +4231,8 @@ class LaplaceOptimizer(Optimizer):
             them, under the same keys :class:`~taurex.optimizer.multinest.
             MultiNestOptimizer` writes. The samplers here already hold the
             draws: the Laplace approximation makes ``num_samples`` of them
-            from the fitted covariance, NUTS and MCLMC make them from their
-            chains, and SMC returns its weighted particles. Until now only the
+            from the fitted covariance, NUTS makes them from its chains, and
+            SMC returns its weighted particles. Until now only the
             median of those draws was used and the draws themselves dropped,
             which left the output file with no ``fit_params``/``tracedata``/
             ``weights`` and made ``taurex-plot --plot-posteriors`` (and any
@@ -4525,9 +4294,9 @@ class LaplaceOptimizer(Optimizer):
     def get_samples(self, solution_id: int) -> npt.NDArray[np.float64]:
         """Posterior draws of the fitted solution.
 
-        The Laplace, NUTS and MCLMC paths return equally weighted draws; SMC
-        and importance sampling return weighted particles, whose weights are
-        available from :meth:`get_weights`.
+        The Laplace and NUTS paths return equally weighted draws; SMC returns
+        weighted particles, whose weights are available from
+        :meth:`get_weights`.
 
         Parameters
         ----------
@@ -4547,8 +4316,8 @@ class LaplaceOptimizer(Optimizer):
     def get_weights(self, solution_id: int) -> npt.NDArray[np.float64]:
         """Weights of the posterior samples.
 
-        The Laplace, NUTS and MCLMC draws are already samples from the
-        posterior, so they carry equal weight. The SMC particles carry the
+        The Laplace and NUTS draws are already samples from the posterior, so
+        they carry equal weight. The SMC particles carry the
         weights the run ended with - the proposal weights when the shortcut
         applied, or the last stage's weights after tempering - and those are
         returned so the reported quantiles use them instead of pretending the
