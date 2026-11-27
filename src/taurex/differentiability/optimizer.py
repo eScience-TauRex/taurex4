@@ -572,9 +572,12 @@ class LaplaceOptimizer(Optimizer):
             samplers, whose reported MAP is the point of the fit.
 
         eigenvalue_floor:
-            Ridge added to the scaled Hessian before inverting it. It bounds
-            the variance of the directions the data does not constrain, so
-            those parameters come back prior dominated rather than undefined.
+            Smallest eigenvalue of the scaled Hessian kept when it is inverted,
+            as a fraction of the largest. It bounds the variance of the
+            directions the data does not constrain, so those parameters come
+            back prior dominated rather than undefined; directions with real
+            curvature sit orders of magnitude above it and keep their exact
+            inverse.
 
         seed:
             Seed for the posterior draws, so a retrieval is reproducible
@@ -2348,7 +2351,12 @@ class LaplaceOptimizer(Optimizer):
 
         if start == "prior":
             positions = prior_positions_of(prior_key)
-            prior_like = _sanitise_log_likelihood(
+            # This is also the fallback from a rejected Laplace proposal, whose
+            # likelihoods were evaluated at the proposal draws. The sharded
+            # path chooses its first tempering increment from ``log_like``, so
+            # it has to be the likelihood of these particles and not the stale
+            # one of the draws that were discarded.
+            log_like = _sanitise_log_likelihood(
                 likelihood_of(positions),
                 positions,
                 transform_of,
@@ -2364,13 +2372,13 @@ class LaplaceOptimizer(Optimizer):
             grid = np.linspace(0.0, 1.0, 21)[:-1]
             with np.errstate(invalid="ignore", over="ignore"):
                 ess_grid = np.array(
-                    [log_ess(np.nan_to_num(beta * prior_like)) for beta in grid]
+                    [log_ess(np.nan_to_num(beta * log_like)) for beta in grid]
                 )
             usable = max(2.0, 0.25 * self.smc_target_ess * particles_count)
             qualifying = grid[ess_grid >= usable]
             beta0 = float(qualifying.max()) if qualifying.size else 0.0
             with np.errstate(invalid="ignore", over="ignore"):
-                log_weights = np.nan_to_num(beta0 * prior_like)
+                log_weights = np.nan_to_num(beta0 * log_like)
             log_evidence = float(
                 scipy_special.logsumexp(log_weights) - np.log(particles_count)
             )
@@ -2380,7 +2388,9 @@ class LaplaceOptimizer(Optimizer):
                 if ess0 > 0.0
                 else 0.0
             )
-            proposal_ess = float(particles_count)
+            # ``proposal_ess`` is kept as it was computed: when a Laplace
+            # proposal was tried and rejected, its ESS is the diagnostic that
+            # says why, and overwriting it with the particle count would hide it.
             if beta0 > 0.0:
                 self.info(
                     "SMC: the prior draws keep ESS %.0f/%d at tempering %.2f, "
@@ -4294,17 +4304,23 @@ class LaplaceOptimizer(Optimizer):
             return np.eye(size, dtype=hessian.dtype), 0.0
 
         scaled = hessian / largest
-        diagonal = np.diagonal(scaled)
-        # The regularisation is chosen so that the scaled matrix is strictly
-        # diagonally dominant, which by Gershgorin's theorem makes it positive
-        # definite whatever the numerical noise in the Hessian did to its
-        # spectrum. Without it a flat or rank deficient Hessian produces a
-        # matrix that cannot be factored at all.
-        off_diagonal = np.sum(np.abs(scaled), axis=1) - np.abs(diagonal)
-        shift = off_diagonal + np.clip(-diagonal, 0.0, None) + self.eigenvalue_floor
-        regularized = scaled + np.diag(shift)
+        # The directions the data does not constrain show up as eigenvalues far
+        # below the curvature scale, or as small negative ones from numerical
+        # noise at the optimum. Clipping that spectrum at the floor keeps the
+        # matrix positive definite and caps the variance of those directions,
+        # while a well conditioned but correlated Hessian keeps its true inverse.
+        # A diagonal shift large enough to make the matrix diagonally dominant
+        # (the Gershgorin bound) would instead add the whole off-diagonal row to
+        # every diagonal entry and shrink the error bars of an ordinary
+        # retrieval by an order of magnitude.
+        eigenvalues, eigenvectors = np.linalg.eigh(scaled)
+        floor = max(
+            self.eigenvalue_floor * float(np.max(np.abs(eigenvalues))),
+            np.finfo(float).tiny,
+        )
+        clipped = (eigenvectors * np.clip(eigenvalues, floor, None)) @ eigenvectors.T
 
-        covariance = np.linalg.inv(regularized)
+        covariance = np.linalg.inv(clipped)
         covariance = 0.5 * (covariance + covariance.T)
         return covariance, 1.0 / largest
 

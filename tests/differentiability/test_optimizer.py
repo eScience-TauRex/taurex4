@@ -507,6 +507,49 @@ def test_fisher_sigma_matches_the_laplace_sigma(taurex_model, observation):
     np.testing.assert_allclose(fisher_sigma, sample_sigma, rtol=0.5)
 
 
+def test_laplace_covariance_is_the_inverse_hessian():
+    """A correlated Hessian is inverted, not regularised away.
+
+    The parameters of a retrieval are strongly correlated, so the diagonal
+    entries of their Hessian are not much larger than the off-diagonal ones.
+    Regularising the matrix enough to make it diagonally dominant would then
+    shrink every error bar by an order of magnitude. The covariance of a
+    positive definite Hessian has to be its exact inverse.
+    """
+    hessian = np.array([[4.0, 3.6], [3.6, 4.0]])
+    optimizer = LaplaceOptimizer()
+
+    covariance, variance_scale = optimizer._laplace_covariance(
+        lambda _: jnp.asarray(hessian), jnp.zeros(2)
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(covariance) * variance_scale,
+        np.linalg.inv(hessian),
+        rtol=1e-10,
+    )
+
+
+def test_laplace_covariance_clips_an_unconstrained_direction():
+    """A flat direction comes back finite and positive definite.
+
+    A Hessian that is only positive semi-definite would make the covariance
+    infinite along the direction the data does not constrain; clipping its
+    spectrum at the floor is what bounds that direction.
+    """
+    hessian = np.array([[1.0, 1.0], [1.0, 1.0]])
+    optimizer = LaplaceOptimizer()
+
+    covariance, variance_scale = optimizer._laplace_covariance(
+        lambda _: jnp.asarray(hessian), jnp.zeros(2)
+    )
+    covariance = np.asarray(covariance) * variance_scale
+
+    assert np.all(np.isfinite(covariance))
+    np.testing.assert_allclose(covariance, covariance.T, rtol=1e-12)
+    assert np.min(np.linalg.eigvalsh(covariance)) > 0.0
+
+
 def test_unknown_sampler_is_rejected():
     """A misspelt sampler is an error rather than a silent Laplace fit."""
     with pytest.raises(ValueError, match="Unknown sampler"):
